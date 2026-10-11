@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      7.1.0
-// @description  チャット識別・フォロー・ブロック・オンライン表示・ドラッグ移動可能なフォロー/ブロック一覧・ライブリアクション・月間ランキング曲ID検索
+// @version      8.0.0
+// @description　チャット識別、フォロー、ブロック、リアクション複数同時送信、過去のランキングから検索
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
 // @grant        GM_xmlhttpRequest
@@ -11,17 +11,13 @@
 // @grant        GM_addValueChangeListener
 // @grant        GM_addStyle
 // @connect      raw.githubusercontent.com
+// @connect      api.github.com
 // @updateURL    https://raw.githubusercontent.com/takesann55/typingtube-ranking-data/main/TypingTube_Assist_Combined.user.js
 // @downloadURL  https://raw.githubusercontent.com/takesann55/typingtube-ranking-data/main/TypingTube_Assist_Combined.user.js
 // @homepageURL  https://github.com/takesann55/typingtube-ranking-data
 // @run-at       document-idle
 // ==/UserScript==
 
-/*
- * TypingTube本体のWebSocketは上書き・差し替えしません。
- * オンライン表示は、現在のページで確認できたチャット活動を基準にします。
- * ブロック情報は自分のTampermonkey内に保存します。
- */
 
 GM_addStyle(String.raw`
 .lobby-chat-msg-user[data-tt-user-color-id],
@@ -253,52 +249,6 @@ GM_addStyle(String.raw`
   outline: 2px solid #d33;
   outline-offset: 2px;
 }
-.tt-user-lists-toolbar {
-  position: fixed;
-  top: 12px;
-  right: 12px;
-  z-index: 2147483000;
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  font-family: sans-serif;
-  touch-action: none;
-  user-select: none;
-}
-.tt-user-list-drag-handle {
-  box-sizing: border-box;
-  width: 28px;
-  height: 30px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid #777;
-  border-radius: 7px;
-  background: #fff;
-  color: #555;
-  font-size: 16px;
-  cursor: grab;
-  box-shadow: 0 2px 8px rgba(0,0,0,.12);
-  touch-action: none;
-}
-.tt-user-list-drag-handle:active {
-  cursor: grabbing;
-}
-.tt-user-list-toggle {
-  box-sizing: border-box;
-  padding: 7px 10px;
-  border: 1px solid #777;
-  border-radius: 7px;
-  background: #fff;
-  color: #333;
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0,0,0,.12);
-}
-.tt-user-list-toggle:hover {
-  background: #f1f1f1;
-}
 .tt-user-list-panel {
   position: fixed;
   top: 52px;
@@ -325,11 +275,6 @@ GM_addStyle(String.raw`
   margin: 0 0 8px;
   padding: 3px 0 6px;
   font-size: 15px;
-  cursor: grab;
-  touch-action: none;
-}
-.tt-user-list-panel h3:active {
-  cursor: grabbing;
 }
 .tt-user-list-search {
   box-sizing: border-box;
@@ -463,7 +408,6 @@ GM_addStyle(String.raw`
   const FOLLOW_BUTTON_CLASS = "tt-user-follow-button";
   const NICKNAME_BUTTON_CLASS = "tt-user-nickname-button";
   const BLOCK_BUTTON_CLASS = "tt-user-block-button";
-
   const LISTS_TOOLBAR_CLASS = "tt-user-lists-toolbar";
   const LIST_PANEL_CLASS = "tt-user-list-panel";
 
@@ -490,8 +434,6 @@ GM_addStyle(String.raw`
   const LEGACY_STORAGE_KEY = "ttUserFavorites";
   const BLOCKED_STORAGE_KEY = "ttBlockedUsers";
   const USER_NAMES_STORAGE_KEY = "ttUserNames";
-  const LISTS_TOOLBAR_POSITION_KEY = "ttUserListsToolbarPosition";
-  const LIST_PANEL_POSITION_KEY = "ttUserListPanelPosition";
 
   let followedUsers = {};
   let blockedUsers = {};
@@ -540,6 +482,7 @@ GM_addStyle(String.raw`
     const blocked = isUserBlocked(userId);
     message.hidden = blocked;
     message.toggleAttribute("data-tt-blocked", blocked);
+    if (blocked && activeUserMenu?.trigger.closest(MESSAGE_SELECTOR) === message) closeUserMenu();
 
     const button = message.querySelector(`.${BLOCK_BUTTON_CLASS}`);
     if (button) {
@@ -547,7 +490,7 @@ GM_addStyle(String.raw`
       button.classList.toggle("is-blocked", blocked);
       button.setAttribute("aria-pressed", String(blocked));
       button.title = blocked
-        ? "このユーザーのブロックを解除します"
+        ? "ブロックを解除します"
         : "このユーザーのチャット発言を非表示にします";
     }
   }
@@ -940,8 +883,8 @@ GM_addStyle(String.raw`
 
     if (titleText) {
       titleText.textContent = mode === "follow"
-        ? "フォローしている人"
-        : "ブロックしている人";
+        ? "フォロー中"
+        : "ブロック中";
     }
 
     if (searchStatus) {
@@ -992,267 +935,268 @@ GM_addStyle(String.raw`
       body.append(createUserListItem(userId, mode));
     });
   }
+  let activeUserMenu = null;
+  let commentPopup = null;
+  let listsPopup = null;
+  let composerScanPending = false;
+  let menuEventsStarted = false;
+
+  function makeMenuButton(text, className, label) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = className;
+    button.textContent = text;
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.setAttribute('aria-haspopup', 'menu');
+    button.setAttribute('aria-expanded', 'false');
+    return button;
+  }
+
+  function closeUserMenu(returnFocus = false) {
+    if (!activeUserMenu) return;
+    const { trigger, popup } = activeUserMenu;
+    popup.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    activeUserMenu = null;
+    if (returnFocus && trigger.isConnected) trigger.focus();
+  }
+
+  function positionUserMenu() {
+    if (!activeUserMenu) return;
+    const { trigger, popup } = activeUserMenu;
+    if (!trigger.isConnected || trigger.getClientRects().length === 0 ||
+        trigger.closest('[hidden], [data-tt-blocked]')) {
+      closeUserMenu();
+      return;
+    }
+    const rect = trigger.getBoundingClientRect();
+    const width = Math.min(popup.offsetWidth || 220, window.innerWidth - 16);
+    const height = popup.offsetHeight || 90;
+    const below = window.innerHeight - rect.bottom - 14;
+    const above = rect.top - 14;
+    const useAbove = below < Math.min(height, 160) && above > below;
+    popup.style.maxHeight = `${Math.max(40, useAbove ? above : below)}px`;
+    popup.style.left = `${Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8))}px`;
+    popup.style.top = `${Math.max(8, useAbove ? rect.top - Math.min(height, above) - 6 : rect.bottom + 6)}px`;
+  }
+
+  function showUserMenu(trigger, popup) {
+    closeUserMenu();
+    if (!popup.isConnected) document.body.append(popup);
+    popup.style.removeProperty('display');
+    popup.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    if (popup.id) trigger.setAttribute('aria-controls', popup.id);
+    activeUserMenu = { trigger, popup };
+    positionUserMenu();
+  }
+
+  function getCommentPopup() {
+    if (commentPopup) return commentPopup;
+    const popup = document.createElement('div');
+    popup.className = 'tt-user-popup tt-comment-popup';
+    popup.id = 'tt-comment-user-menu';
+    popup.hidden = true;
+    popup.setAttribute('role', 'menu');
+    const profile = document.createElement('a');
+    profile.className = 'tt-menu-item';
+    profile.textContent = 'プロフィール';
+    profile.target = '_blank';
+    profile.rel = 'noopener noreferrer';
+    profile.setAttribute('role', 'menuitem');
+    profile.addEventListener('click', () => closeUserMenu());
+    const block = document.createElement('button');
+    block.type = 'button';
+    block.className = 'tt-menu-item';
+    block.setAttribute('role', 'menuitem');
+    block.addEventListener('click', event => {
+      event.preventDefault();
+      const id = popup.dataset.userId;
+      closeUserMenu();
+      void toggleBlock(id);
+    });
+    popup.append(profile, block);
+    document.body.append(popup);
+    commentPopup = popup;
+    return popup;
+  }
 
   function openUserList(mode) {
+    if (!userListsPanel) createUserListsToolbar();
     if (!userListsPanel) return;
-
+    const trigger = activeUserMenu?.trigger || document.querySelector('.tt-composer-meatball');
+    if (!trigger) return;
     userListsPanel.dataset.mode = mode;
-    userListsPanel.hidden = false;
-    userListsPanel.style.removeProperty("display");
-
-    const search = userListsPanel.querySelector(".tt-user-list-search");
-    if (search) search.value = "";
-
+    const search = userListsPanel.querySelector('.tt-user-list-search');
+    if (search) search.value = '';
     renderUserLists();
-  }
-
-  function readStoredPosition(key) {
-    try {
-      const value = GM_getValue(key, null);
-
-      if (
-        value &&
-        Number.isFinite(Number(value.left)) &&
-        Number.isFinite(Number(value.top))
-      ) {
-        return {
-          left: Number(value.left),
-          top: Number(value.top)
-        };
-      }
-    } catch (_) {
-    }
-
-    return null;
-  }
-
-  function clampPosition(element, left, top) {
-    const rect = element.getBoundingClientRect();
-    const maxLeft = Math.max(0, window.innerWidth - rect.width);
-    const maxTop = Math.max(0, window.innerHeight - rect.height);
-
-    return {
-      left: Math.min(Math.max(0, left), maxLeft),
-      top: Math.min(Math.max(0, top), maxTop)
-    };
-  }
-
-  function setElementPosition(element, position) {
-    if (!element) return;
-
-    const safe = clampPosition(
-      element,
-      Number(position.left),
-      Number(position.top)
-    );
-
-    element.style.left = `${safe.left}px`;
-    element.style.top = `${safe.top}px`;
-    element.style.right = "auto";
-    element.style.bottom = "auto";
-  }
-
-  function saveElementPosition(key, element) {
-    if (!element) return;
-
-    const rect = element.getBoundingClientRect();
-
-    try {
-      GM_setValue(key, {
-        left: Math.round(rect.left),
-        top: Math.round(rect.top)
-      });
-    } catch (_) {
-    }
-  }
-
-  function makeDraggable(element, handle, storageKey) {
-    if (!element || !handle || handle.dataset.ttDraggable === "1") return;
-
-    handle.dataset.ttDraggable = "1";
-
-    const stored = readStoredPosition(storageKey);
-    if (stored) setElementPosition(element, stored);
-
-    let dragging = false;
-    let pointerId = null;
-    let startX = 0;
-    let startY = 0;
-    let startLeft = 0;
-    let startTop = 0;
-
-    const onPointerMove = (event) => {
-      if (!dragging || event.pointerId !== pointerId) return;
-
-      event.preventDefault();
-
-      const next = clampPosition(
-        element,
-        startLeft + event.clientX - startX,
-        startTop + event.clientY - startY
-      );
-
-      element.style.left = `${next.left}px`;
-      element.style.top = `${next.top}px`;
-      element.style.right = "auto";
-      element.style.bottom = "auto";
-    };
-
-    const stop = (event) => {
-      if (
-        !dragging ||
-        (event && event.pointerId !== pointerId)
-      ) {
-        return;
-      }
-
-      dragging = false;
-
-      try {
-        handle.releasePointerCapture(pointerId);
-      } catch (_) {
-      }
-
-      document.removeEventListener("pointermove", onPointerMove, true);
-      document.removeEventListener("pointerup", stop, true);
-      document.removeEventListener("pointercancel", stop, true);
-
-      saveElementPosition(storageKey, element);
-      pointerId = null;
-    };
-
-    handle.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 && event.pointerType !== "touch") return;
-
-      dragging = true;
-      pointerId = event.pointerId;
-
-      const rect = element.getBoundingClientRect();
-      startX = event.clientX;
-      startY = event.clientY;
-      startLeft = rect.left;
-      startTop = rect.top;
-
-      try {
-        handle.setPointerCapture(pointerId);
-      } catch (_) {
-      }
-
-      document.addEventListener("pointermove", onPointerMove, true);
-      document.addEventListener("pointerup", stop, true);
-      document.addEventListener("pointercancel", stop, true);
-
-      event.preventDefault();
-      event.stopPropagation();
-    });
+    showUserMenu(trigger, userListsPanel);
+    search?.focus();
   }
 
   function createUserListsToolbar() {
-    if (document.querySelector(`.${LISTS_TOOLBAR_CLASS}`)) {
-      userListsPanel = document.querySelector(`.${LIST_PANEL_CLASS}`);
-      return;
-    }
-
-    const toolbar = document.createElement("div");
-    toolbar.className = LISTS_TOOLBAR_CLASS;
-
-    const dragHandle = document.createElement("button");
-    dragHandle.type = "button";
-    dragHandle.className = "tt-user-list-drag-handle";
-    dragHandle.textContent = "⠿";
-    dragHandle.title = "ここをドラッグして一覧ボタンを移動";
-    dragHandle.setAttribute("aria-label", "一覧ボタンを移動");
-
-    const followButton = document.createElement("button");
-    followButton.type = "button";
-    followButton.className = "tt-user-list-toggle";
-    followButton.textContent = "★ フォロー一覧";
-    followButton.addEventListener("click", () => openUserList("follow"));
-
-    const blockButton = document.createElement("button");
-    blockButton.type = "button";
-    blockButton.className = "tt-user-list-toggle";
-    blockButton.textContent = "🚫 ブロック一覧";
-    blockButton.addEventListener("click", () => openUserList("block"));
-
-    toolbar.append(dragHandle, followButton, blockButton);
-    document.body.append(toolbar);
-
-    const panel = document.createElement("div");
-    panel.className = LIST_PANEL_CLASS;
-    panel.hidden = true;
-    panel.dataset.mode = "follow";
-
-    const title = document.createElement("h3");
-    title.className = "tt-user-list-title";
-
-    const titleText = document.createElement("span");
-    titleText.className = "tt-user-list-title-text";
-    titleText.textContent = "フォローしている人";
-
-    const titleDrag = document.createElement("span");
-    titleDrag.className = "tt-user-list-title-drag";
-    titleDrag.textContent = "⠿";
-    titleDrag.title = "ここをドラッグして一覧を移動";
-    titleDrag.style.cssText =
-      "float:left; margin-right:8px; cursor:grab; user-select:none; touch-action:none;";
-
-    const closeButton = document.createElement("button");
-    closeButton.type = "button";
-    closeButton.className = "tt-user-list-action";
-    closeButton.textContent = "閉じる";
-    closeButton.style.float = "right";
-
-    closeButton.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
+    if (!userListsPanel || !userListsPanel.isConnected) {
+      const panel = document.createElement('div');
+      panel.className = LIST_PANEL_CLASS + ' tt-user-popup';
+      panel.id = 'tt-user-list-popup';
       panel.hidden = true;
-      panel.style.setProperty("display", "none", "important");
-    });
-
-    title.append(titleDrag, titleText, closeButton);
-
-    const searchInput = document.createElement("input");
-    searchInput.type = "search";
-    searchInput.className = "tt-user-list-search";
-    searchInput.placeholder = "ユーザー名で検索";
-    searchInput.autocomplete = "off";
-    searchInput.spellcheck = false;
-    searchInput.setAttribute("aria-label", "ユーザー名で検索");
-
-    searchInput.addEventListener("input", () => renderUserLists());
-
-    const searchStatus = document.createElement("div");
-    searchStatus.className = "tt-user-list-search-status";
-    searchStatus.setAttribute("aria-live", "polite");
-
-    const body = document.createElement("div");
-    body.className = "tt-user-list-body";
-
-    panel.append(title, searchInput, searchStatus, body);
-    document.body.append(panel);
-    userListsPanel = panel;
-
-    makeDraggable(toolbar, dragHandle, LISTS_TOOLBAR_POSITION_KEY);
-    makeDraggable(panel, titleDrag, LIST_PANEL_POSITION_KEY);
-
-    window.addEventListener("resize", () => {
-      if (toolbar.isConnected) {
-        setElementPosition(toolbar, {
-          left: toolbar.getBoundingClientRect().left,
-          top: toolbar.getBoundingClientRect().top
+      panel.dataset.mode = 'follow';
+      panel.setAttribute('role', 'dialog');
+      panel.setAttribute('aria-label', 'フォロー・ブロック一覧');
+      const title = document.createElement('h3');
+      title.className = 'tt-user-list-title';
+      const titleText = document.createElement('span');
+      titleText.className = 'tt-user-list-title-text';
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'tt-user-list-action';
+      close.textContent = '閉じる';
+      close.addEventListener('click', () => closeUserMenu(true));
+      title.append(titleText, close);
+      const tabs = document.createElement('div');
+      tabs.className = 'tt-list-tabs';
+      for (const [mode, label] of [['follow', 'フォロー一覧'], ['block', 'ブロック一覧']]) {
+        const tab = document.createElement('button');
+        tab.type = 'button';
+        tab.className = 'tt-user-list-action';
+        tab.textContent = label;
+        tab.addEventListener('click', () => {
+          panel.dataset.mode = mode;
+          search.value = '';
+          renderUserLists();
+          positionUserMenu();
         });
+        tabs.append(tab);
       }
+      const search = document.createElement('input');
+      search.type = 'search';
+      search.className = 'tt-user-list-search';
+      search.placeholder = 'ユーザー名・IDで検索';
+      search.setAttribute('aria-label', 'ユーザー名・IDで検索');
+      search.addEventListener('input', () => { renderUserLists(); positionUserMenu(); });
+      const count = document.createElement('div');
+      count.className = 'tt-user-list-search-status';
+      count.setAttribute('aria-live', 'polite');
+      const body = document.createElement('div');
+      body.className = 'tt-user-list-body';
+      panel.append(title, tabs, search, count, body);
+      document.body.append(panel);
+      userListsPanel = panel;
+    }
+    if (!listsPopup || !listsPopup.isConnected) {
+      const popup = document.createElement('div');
+      popup.className = 'tt-user-popup tt-lists-popup';
+      popup.id = 'tt-follow-block-menu';
+      popup.hidden = true;
+      popup.setAttribute('role', 'menu');
+      for (const [mode, label] of [['follow', '★ フォロー一覧'], ['block', 'ブロック一覧']]) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tt-menu-item';
+        button.textContent = label;
+        button.setAttribute('role', 'menuitem');
+        button.addEventListener('click', () => openUserList(mode));
+        popup.append(button);
+      }
+      document.body.append(popup);
+      listsPopup = popup;
+    }
+    decorateChatComposers();
+  }
 
-      if (panel.isConnected && !panel.hidden) {
-        setElementPosition(panel, {
-          left: panel.getBoundingClientRect().left,
-          top: panel.getBoundingClientRect().top
-        });
+  function findComposerRow(input) {
+    const identity = [input.id, input.className, input.name, input.placeholder,
+      ...Array.from(input.attributes, attr => attr.name + '=' + attr.value)].join(' ');
+    const controller = input.closest('[data-controller]')?.getAttribute('data-controller') || '';
+    const inChat = /chat|comment|message|コメント|チャット|メッセージ/i.test(identity) ||
+      /chat/i.test(controller);
+    if (!inChat || input.closest('.tt-user-popup, #tt-cloud-id-search-v006') ||
+        input.disabled || input.type === 'search' || input.type === 'hidden') return null;
+    let row = input.parentElement;
+    for (let level = 0; row && row !== document.body && level < 6; level++, row = row.parentElement) {
+      const candidates = Array.from(row.querySelectorAll('button, input[type="submit"]'));
+      const send = candidates.find(button => {
+        if (button.closest('.tt-user-popup') || button.classList.contains('tt-composer-meatball')) return false;
+        const action = button.getAttribute('data-action') || '';
+        const text = [button.textContent, button.value, button.title, button.getAttribute('aria-label')].join(' ');
+        return /#(?:sendMessage|sendChat|submitChat|postMessage|sendComment|send)(?:\s|$)/i.test(action) ||
+          /(?:chat|comment|message)[-_]?send|send[-_]?(?:chat|comment|message)/i.test(button.className) ||
+          /送信|投稿|send|post comment/i.test(text) ||
+          (button.type === 'submit' && /chat|comment/i.test(identity + ' ' + controller));
+      });
+      if (!send) continue;
+      let fieldPart = input;
+      let sendPart = send;
+      while (fieldPart.parentElement !== row) fieldPart = fieldPart.parentElement;
+      while (sendPart.parentElement !== row) sendPart = sendPart.parentElement;
+      if (fieldPart === sendPart) continue;
+      return { row, fieldPart, sendPart };
+    }
+    return null;
+  }
+
+  function decorateChatComposers() {
+    for (const input of document.querySelectorAll('textarea, input:not([type]), input[type="text"]')) {
+      const found = findComposerRow(input);
+      if (!found) continue;
+      const { row, fieldPart, sendPart } = found;
+      row.classList.add('tt-chat-composer-row');
+      fieldPart.classList.add('tt-chat-composer-field');
+      sendPart.classList.add('tt-chat-composer-send');
+      const existing = row.querySelector(':scope > .tt-composer-meatball');
+      if (existing) {
+        if (existing.nextElementSibling !== sendPart) sendPart.before(existing);
+        continue;
+      }
+      const button = makeMenuButton('…', 'tt-composer-meatball', 'フォロー・ブロック一覧');
+      sendPart.before(button);
+      button.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (activeUserMenu?.trigger === button) { closeUserMenu(); return; }
+        showUserMenu(button, listsPopup);
+      });
+    }
+  }
+
+  function scheduleComposerMenus() {
+    if (composerScanPending) return;
+    composerScanPending = true;
+    window.requestAnimationFrame(() => {
+      composerScanPending = false;
+      decorateChatComposers();
+      if (activeUserMenu) positionUserMenu();
+    });
+  }
+
+  function startUserMenuEvents() {
+    if (menuEventsStarted) return;
+    menuEventsStarted = true;
+    document.addEventListener('pointerdown', event => {
+      if (activeUserMenu && !activeUserMenu.trigger.contains(event.target) &&
+          !activeUserMenu.popup.contains(event.target)) closeUserMenu();
+    });
+    document.addEventListener('keydown', event => {
+      if (!activeUserMenu) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeUserMenu(true);
+      } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) &&
+                 (activeUserMenu.trigger === event.target || activeUserMenu.popup.contains(event.target)) &&
+                 !event.target.matches('input, textarea')) {
+        const items = Array.from(activeUserMenu.popup.querySelectorAll('[role="menuitem"]'));
+        if (!items.length) return;
+        event.preventDefault();
+        const index = items.indexOf(document.activeElement);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 :
+          (index + (event.key === 'ArrowUp' ? -1 : 1) + items.length) % items.length;
+        items[next].focus();
       }
     });
-
-    renderUserLists();
+    window.addEventListener('resize', positionUserMenu);
+    window.addEventListener('scroll', positionUserMenu, true);
+    document.addEventListener('turbo:before-cache', () => closeUserMenu());
   }
 
   function getProfileUserId() {
@@ -1375,7 +1319,7 @@ GM_addStyle(String.raw`
     } catch (error) {
       console.error("TypingTubeのフォロー情報を保存できませんでした。", error);
       window.alert(
-        "フォロー情報を保存できませんでした。拡張機能を再読み込みして、もう一度お試しください。"
+        "フォロー情報を保存できませんでした。"
       );
     }
   }
@@ -1496,71 +1440,45 @@ GM_addStyle(String.raw`
   }
 
   function decorateMessage(message) {
-    if (!(message instanceof Element) || !message.matches(MESSAGE_SELECTOR)) {
-      return;
-    }
-
+    if (!(message instanceof Element) || !message.matches(MESSAGE_SELECTOR)) return;
     const userName = message.querySelector(USER_SELECTOR);
     const reportButton = message.querySelector(REPORT_SELECTOR);
     const userId = reportButton?.dataset.reportedUserId?.trim();
-
-    message.querySelectorAll(`.${OLD_FAVORITE_BUTTON_CLASS}`)
-      .forEach((button) => button.remove());
-
+    message.querySelectorAll(`.${OLD_FAVORITE_BUTTON_CLASS}, .${PROFILE_BUTTON_CLASS}, .${BLOCK_BUTTON_CLASS}`)
+      .forEach(button => button.remove());
     if (!userName || !reportButton || !userId) return;
 
-    let profileButton = message.querySelector(`.${PROFILE_BUTTON_CLASS}`);
-
-    if (!profileButton) {
-      profileButton = document.createElement("a");
-      profileButton.className = PROFILE_BUTTON_CLASS;
-      profileButton.textContent = "プロフィール";
-      profileButton.target = "_blank";
-      profileButton.rel = "noopener noreferrer";
-      profileButton.setAttribute("role", "button");
-      reportButton.insertAdjacentElement("afterend", profileButton);
+    let trigger = message.querySelector('.tt-comment-kebab');
+    if (!trigger) {
+      trigger = makeMenuButton('⋮', 'tt-comment-kebab', 'このコメントのユーザーメニュー');
+      reportButton.insertAdjacentElement('afterend', trigger);
+      trigger.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (activeUserMenu?.trigger === trigger) { closeUserMenu(); return; }
+        const id = trigger.dataset.userId;
+        const popup = getCommentPopup();
+        popup.dataset.userId = id;
+        const profile = popup.querySelector('a');
+        profile.href = `/user/${encodeURIComponent(id)}`;
+        profile.setAttribute('aria-label', `${trigger.dataset.userName}のプロフィールを開く`);
+        const block = popup.querySelector('button');
+        block.textContent = isUserBlocked(id) ? 'ブロック解除' : 'ブロック';
+        block.setAttribute('aria-pressed', String(isUserBlocked(id)));
+        showUserMenu(trigger, popup);
+      });
     }
-
-    profileButton.href = `/user/${encodeURIComponent(userId)}`;
-    profileButton.title = `ユーザーID ${userId} のプロフィールを開く`;
-
-    let blockButton = message.querySelector(`.${BLOCK_BUTTON_CLASS}`);
-
-    if (!blockButton) {
-      blockButton = document.createElement("button");
-      blockButton.type = "button";
-      blockButton.className = BLOCK_BUTTON_CLASS;
-      blockButton.addEventListener("click", () => toggleBlock(userId));
-      profileButton.insertAdjacentElement("afterend", blockButton);
-    }
-
-    blockButton.dataset.userId = userId;
-
+    trigger.dataset.userId = userId;
+    trigger.dataset.userName = getOriginalName(userName);
     if (userName.getAttribute(PROCESSED_ATTRIBUTE) !== userId) {
-      const hue = colorFromUserId(userId);
-      userName.style.setProperty("--tt-user-hue", hue.toFixed(2));
+      userName.style.setProperty('--tt-user-hue', colorFromUserId(userId).toFixed(2));
       userName.setAttribute(PROCESSED_ATTRIBUTE, userId);
       getOriginalName(userName);
     }
-
     rememberUserName(userId, userName);
     markUserOnline(userId);
     applyUserState(userName, userId);
     applyBlockState(message, userId);
-
-    blockButton.textContent = isUserBlocked(userId)
-      ? "ブロック解除"
-      : "ブロック";
-    blockButton.classList.toggle("is-blocked", isUserBlocked(userId));
-    blockButton.setAttribute("aria-pressed", String(isUserBlocked(userId)));
-    blockButton.title = isUserBlocked(userId)
-      ? "このユーザーのブロックを解除します"
-      : "このユーザーのチャット発言を非表示にします";
-
-    profileButton.setAttribute(
-      "aria-label",
-      `${getOriginalName(userName)}のプロフィールを開く`
-    );
   }
 
   function decorateMessagesInside(root) {
@@ -2125,6 +2043,7 @@ GM_addStyle(String.raw`
         }
       }
 
+      scheduleComposerMenus();
       if (profileHeaderAdded) {
         decorateProfilePage();
       }
@@ -2136,7 +2055,11 @@ GM_addStyle(String.raw`
       attributes: true,
       attributeFilter: [
         "data-reported-user-id",
-        "data-live-event-target"
+        "data-live-event-target",
+        "data-lobby-chat-target",
+        "data-room-chat-target",
+        "data-battle-room-target",
+        "placeholder"
       ]
     });
   }
@@ -2261,6 +2184,7 @@ GM_addStyle(String.raw`
     }
 
     createUserListsToolbar();
+    startUserMenuEvents();
 
     window.setInterval(() => {
       if (userListsPanel && !userListsPanel.hidden) {
@@ -2276,6 +2200,7 @@ GM_addStyle(String.raw`
     startObserver();
 
     document.addEventListener("turbo:load", () => {
+      closeUserMenu();
       createUserListsToolbar();
       decorateMessagesInside(document);
       decorateProfilePage();
@@ -2324,28 +2249,84 @@ GM_addStyle(String.raw`
   initialize();
 })();
 
-(() => {
-  "use strict";
+GM_addStyle(`
+.tt-comment-kebab, .tt-composer-meatball {
+  box-sizing: border-box !important; display: inline-flex !important;
+  flex: 0 0 32px !important; width: 32px !important; height: 32px !important;
+  align-items: center; justify-content: center; padding: 0 !important;
+  border: 1px solid #9ba5af !important; border-radius: 4px !important;
+  background: #fff !important; color: #263544 !important;
+  font: 700 22px/1 sans-serif !important; cursor: pointer;
+  vertical-align: middle; margin: 0 3px; touch-action: manipulation;
+}
+.tt-comment-kebab { flex-basis: 24px !important; width: 24px !important; height: 26px !important; }
+.tt-comment-kebab:hover, .tt-composer-meatball:hover { background: #edf3fa !important; }
+.tt-comment-kebab:focus-visible, .tt-composer-meatball:focus-visible, .tt-menu-item:focus-visible {
+  outline: 2px solid #1976d2 !important; outline-offset: 2px;
+}
+.tt-chat-composer-row {
+  display: flex !important; align-items: center !important; gap: 5px;
+  min-width: 0 !important;
+}
+.tt-chat-composer-row > .tt-chat-composer-field {
+  flex: 1 1 0% !important; min-width: 0 !important; width: auto !important;
+}
+.tt-chat-composer-field input, .tt-chat-composer-field textarea { min-width: 0 !important; max-width: 100%; }
+.tt-chat-composer-row > .tt-chat-composer-send { flex: 0 0 auto !important; }
+.tt-composer-meatball { margin: 0 !important; }
+.tt-user-popup {
+  position: fixed !important; right: auto !important; bottom: auto !important;
+  z-index: 2147483100 !important; width: min(220px, calc(100vw - 16px));
+  box-sizing: border-box; padding: 5px; margin: 0; overflow: auto;
+  border: 1px solid #b6c2ce; border-radius: 7px; background: #fff; color: #22313f;
+  box-shadow: 0 5px 20px #0003; font: 13px/1.5 sans-serif;
+}
+.tt-user-popup[hidden] { display: none !important; }
+.tt-user-popup .tt-menu-item {
+  box-sizing: border-box !important; display: flex !important; width: 100% !important;
+  min-height: 38px !important; height: 38px !important; align-items: center !important;
+  justify-content: flex-start !important; padding: 8px 12px !important; margin: 0 !important;
+  border: 0 !important; border-radius: 4px !important; background: #fff !important;
+  color: #22313f !important; font: 13px/1.5 sans-serif !important;
+  text-decoration: none !important; text-align: left !important; cursor: pointer;
+}
+.tt-user-popup .tt-menu-item:hover { background: #edf3fa !important; }
+.tt-user-list-panel.tt-user-popup { width: min(380px, calc(100vw - 16px)); padding: 12px; user-select: text; }
+.tt-user-list-panel .tt-user-list-title {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  cursor: default !important; touch-action: auto !important;
+}
+.tt-list-tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+`);
 
-  if (
-    window.top !== window ||
-    document.getElementById("tt-cloud-id-search-v006")
-  ) {
-    return;
+(() => {
+  'use strict';
+  if (window.top !== window || document.getElementById('tt-cloud-id-search-v006')) return;
+
+  const DEFAULT_DATA_URL = 'https://raw.githubusercontent.com/takesann55/typingtube-ranking-data/main/typingtube_rankings_v001.bin';
+  const STORAGE_KEY = 'tt-cloud-rank-data-url-v006';
+  const CHOICE_KEY = 'tt-cloud-rank-choice-v080';
+  const CATALOG_KEY = 'tt-cloud-rank-catalog-v080';
+  const DATE_KEY = 'tt-cloud-rank-dates-v080';
+  const CACHE_TTL = 60 * 60 * 1000;
+  const MAX_RESULTS = 100;
+  const FILE_PATTERN = /^typingtube_rankings_v(\d+)\.bin$/;
+
+  let rows = [], anchor = null, open = false, settingsOpen = false;
+  let catalog = [], catalogIdentity = '', catalogPromise = null, catalogGeneration = 0;
+  let loadGeneration = 0, loadedLabel = '', loadedURL = '', datesPromise = null;
+  let apiBlockedUntil = 0;
+
+  const oldURL = GM_getValue(STORAGE_KEY, DEFAULT_DATA_URL);
+  let choice = GM_getValue(CHOICE_KEY, null);
+  if (!choice || !['latest', 'file', 'custom'].includes(choice.mode) || typeof choice.url !== 'string') {
+    choice = { mode: oldURL === DEFAULT_DATA_URL ? 'latest' : 'custom', url: oldURL || DEFAULT_DATA_URL };
   }
 
-  const DEFAULT_DATA_URL =
-    "https://raw.githubusercontent.com/takesann55/typingtube-ranking-data/main/typingtube_rankings_v001.bin";
-  const STORAGE_KEY = "tt-cloud-rank-data-url-v006";
-  const MAX_RESULTS = 100;
+  let dateCache = GM_getValue(DATE_KEY, {});
+  if (!dateCache || typeof dateCache !== 'object' || Array.isArray(dateCache)) dateCache = {};
 
-  let rows = [];
-  let anchor = null;
-  let open = false;
-  let settingsOpen = false;
-
-  const normalize = value =>
-    String(value).normalize("NFKC").toLocaleLowerCase("ja-JP");
+  const normalize = value => String(value).normalize('NFKC').toLocaleLowerCase('ja-JP');
 
   const make = (tag, className, label) => {
     const element = document.createElement(tag);
@@ -2354,186 +2335,165 @@ GM_addStyle(String.raw`
     return element;
   };
 
-  const host = make("div");
-  host.id = "tt-cloud-id-search-v006";
+  const safeSave = async (key, value) => {
+    try { await GM_setValue(key, value); }
+    catch (error) { console.warn('TypingTube設定の保存に失敗しました。', error); }
+  };
 
-  const root = host.attachShadow({
-    mode: "open"
-  });
+  function parseRawURL(value) {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.hostname !== 'raw.githubusercontent.com') {
+      throw new Error('GitHubのRaw URLを指定してください');
+    }
+    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+    if (parts.length < 4 || parts.some(part => part === '.' || part === '..')) throw new Error('ファイルのURLが不正です');
+    const [owner, repo, ref, ...rest] = parts;
+    const path = rest.join('/');
+    const slash = path.lastIndexOf('/');
+    return { owner, repo, ref, path, dir: slash < 0 ? '' : path.slice(0, slash),
+      identity: `${owner}/${repo}/${ref}/${slash < 0 ? '' : path.slice(0, slash)}` };
+  }
 
-  const css = make("style");
+  function rawFileURL(source, path) {
+    return `https://raw.githubusercontent.com/${encodeURIComponent(source.owner)}/${encodeURIComponent(source.repo)}/${encodeURIComponent(source.ref)}/${path.split('/').map(encodeURIComponent).join('/')}`;
+  }
+
+  function apiBase(source) {
+    return `https://api.github.com/repos/${encodeURIComponent(source.owner)}/${encodeURIComponent(source.repo)}`;
+  }
+
+  function dateText(value) {
+    const date = new Date(value);
+    return value && Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat('ja-JP', {
+      timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false
+    }).format(date) + '（日本時間）' : '取得できませんでした';
+  }
+
+  function captureText(file) {
+    return file.url === DEFAULT_DATA_URL ? '収集日：2026年9月25日' : '収集日：未登録';
+  }
+
+  function versionText(file) {
+    return `v${file.version} ／ ${captureText(file).replace('収集日：', '')}`;
+  }
+
+  const host = make('div');
+  host.id = 'tt-cloud-id-search-v006';
+  const root = host.attachShadow({ mode: 'open' });
+
+  const css = make('style');
   css.textContent = `
-    :host { all: initial; }
-    * { box-sizing: border-box; }
-    button, input { font: inherit; }
-    .search-row {
-      display: flex;
-      gap: 5px;
-      align-items: center;
-      height: 100%;
-      font: 14px sans-serif;
-    }
-    .query {
-      flex: 1;
-      min-width: 0;
-      width: 100%;
-      height: 100%;
-      padding: 0 10px;
-      border: 1px solid #aab6c1;
-      border-radius: 6px;
-      background: #fff;
-      color: #17202a;
-      outline: none;
-    }
-    .query:focus {
-      border-color: #2680c2;
-      box-shadow: 0 0 0 2px #2680c233;
-    }
-    .gear, .load, .copy, .close {
-      border: 1px solid #aab6c1;
-      border-radius: 6px;
-      background: #fff;
-      color: #17202a;
-      cursor: pointer;
-      padding: 5px 8px;
-    }
+    :host { all: initial; } * { box-sizing: border-box; }
+    button, input, select { font: inherit; }
+    .search-row { display: flex; gap: 5px; align-items: center; height: 100%; font: 14px sans-serif; }
+    .query { flex: 1; min-width: 0; width: 100%; height: 100%; padding: 0 10px;
+      border: 1px solid #aab6c1; border-radius: 6px; background: #fff; color: #17202a; }
+    .query:focus { outline: 2px solid #2680c2; }
+    button { border: 1px solid #aab6c1; border-radius: 6px; background: #fff; color: #17202a;
+      cursor: pointer; padding: 5px 8px; }
+    button:hover { background: #edf3fa; } button:disabled { opacity: .6; cursor: wait; }
     .gear { height: 100%; flex: none; }
-    .drop {
-      position: absolute;
-      top: calc(100% + 6px);
-      right: 0;
-      width: min(420px, calc(100vw - 24px));
-      max-height: min(560px, calc(100vh - 100px));
-      overflow: auto;
-      background: #fff;
-      color: #17202a;
-      border: 1px solid #bbc8d3;
-      border-radius: 10px;
-      box-shadow: 0 8px 28px #0005;
-      padding: 12px;
-      font: 14px/1.5 sans-serif;
-    }
-    .drop[hidden], .settings[hidden] { display: none; }
-    .head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-    .head strong { font-size: 15px; }
-    .head-actions {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex: none;
-    }
-    .status {
-      color: #425568;
-      margin: 8px 0;
-      overflow-wrap: anywhere;
-    }
-    .settings {
-      border: 1px solid #d9e2ea;
-      border-radius: 7px;
-      padding: 8px;
-      margin: 8px 0;
-    }
-    .settings label {
-      display: block;
-      font-size: 12px;
-      margin-bottom: 4px;
-    }
-    .settings-row { display: flex; gap: 6px; }
-    .url {
-      min-width: 0;
-      flex: 1;
-      padding: 6px;
-      border: 1px solid #aab6c1;
-      border-radius: 5px;
-      background: #fff;
-      color: #17202a;
-    }
+    .drop { position: absolute; top: calc(100% + 6px); right: 0;
+      width: min(480px, calc(100vw - 24px)); max-height: min(650px, calc(100vh - 100px));
+      overflow: auto; background: #fff; color: #17202a; border: 1px solid #bbc8d3;
+      border-radius: 10px; box-shadow: 0 8px 28px #0005; padding: 12px; font: 14px/1.5 sans-serif; }
+    [hidden] { display: none !important; }
+    .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .head strong { font-size: 15px; } .head-actions { display: flex; align-items: center; gap: 8px; }
+    .status, .catalog-status { color: #425568; margin: 8px 0; overflow-wrap: anywhere; }
+    .settings { border: 1px solid #d9e2ea; border-radius: 7px; padding: 10px; margin: 8px 0; }
+    label { display: block; font-size: 12px; margin: 6px 0 4px; }
+    .settings-row { display: flex; gap: 6px; align-items: center; }
+    .version-select, .url { min-width: 0; flex: 1; width: 100%; padding: 6px;
+      border: 1px solid #aab6c1; border-radius: 5px; background: #fff; color: #17202a; }
+    .note { color: #586a7a; font-size: 12px; margin: 7px 0; }
+    .history { list-style: none; margin: 0 0 10px; padding: 0; max-height: 250px; overflow: auto; }
+    .history-item { border-top: 1px solid #dce5ee; padding: 9px 0; }
+    .history-item.is-selected { background: #edf5ff; }
+    .history-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .history-date, .history-file { font-size: 12px; color: #506273; overflow-wrap: anywhere; }
+    summary { cursor: pointer; font-size: 12px; }
     .results { list-style: none; padding: 0; margin: 0; }
-    .item {
-      border-top: 1px solid #e1e7ed;
-      padding: 9px 0;
-      overflow-wrap: anywhere;
-    }
-    .title { font-weight: 600; }
-    .meta { color: #425568; margin: 4px 0; }
-    .actions {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
+    .item { border-top: 1px solid #e1e7ed; padding: 9px 0; overflow-wrap: anywhere; }
+    .title { font-weight: 600; } .meta { color: #425568; margin: 4px 0; }
+    .actions { display: flex; align-items: center; gap: 10px; }
     a { color: #07569d; text-decoration: underline; }
   `;
 
   root.append(css);
 
-  const searchRow = make("div", "search-row");
+  const searchRow = make('div', 'search-row');
+  const query = make('input', 'query');
+  query.type = 'search';
+  query.placeholder = 'ランキングから曲ID検索';
+  query.autocomplete = 'off';
+  query.setAttribute('aria-label', '月間ランキングの曲名からIDを検索');
 
-  const query = make("input", "query");
-  query.type = "search";
-  query.placeholder = "ランキングから曲ID検索";
-  query.autocomplete = "off";
-  query.setAttribute(
-    "aria-label",
-    "月間ランキングの曲名からIDを検索"
-  );
-
-  const gear = make("button", "gear", "⚙");
-  gear.type = "button";
-  gear.title = "データURLを設定";
-
+  const gear = make('button', 'gear', '⚙');
+  gear.type = 'button';
+  gear.title = 'ランキングの版・更新履歴';
   searchRow.append(query, gear);
 
-  const drop = make("div", "drop");
+  const drop = make('div', 'drop');
   drop.hidden = true;
+  const head = make('div', 'head');
 
-  const head = make("div", "head");
-  const heading = make("strong", "", "月間ランキング 曲ID検索");
+  const repoLink = make('a', '', 'GitHubの更新履歴');
+  repoLink.href = 'https://github.com/takesann55/typingtube-ranking-data';
+  repoLink.target = '_blank';
+  repoLink.rel = 'noopener noreferrer';
 
-  const repoLink = make("a", "", "GitHubで更新履歴を見る");
-  repoLink.href =
-    "https://github.com/takesann55/typingtube-ranking-data";
-  repoLink.target = "_blank";
-  repoLink.rel = "noopener noreferrer";
+  const close = make('button', 'close', '×');
+  close.type = 'button';
+  close.setAttribute('aria-label', '検索結果を閉じる');
 
-  const close = make("button", "close", "×");
-  close.type = "button";
-  close.setAttribute("aria-label", "結果を閉じる");
-
-  const headActions = make("div", "head-actions");
+  const headActions = make('div', 'head-actions');
   headActions.append(repoLink, close);
-  head.append(heading, headActions);
+  head.append(make('strong', '', '月間ランキング 曲ID検索'), headActions);
 
-  const status = make(
-    "div",
-    "status",
-    "公開データのURLを設定してください。"
-  );
+  const status = make('div', 'status', 'ランキングを読み込み中…');
+  status.setAttribute('aria-live', 'polite');
 
-  const settings = make("div", "settings");
+  const settings = make('section', 'settings');
   settings.hidden = true;
 
-  const label = make("label", "", "GitHubのRaw URL");
-  const settingsRow = make("div", "settings-row");
+  const versionLabel = make('label', '', '検索するランキングの版');
+  versionLabel.htmlFor = 'tt-ranking-version';
 
-  const urlInput = make("input", "url");
-  urlInput.type = "url";
-  urlInput.placeholder =
-    "https://raw.githubusercontent.com/.../typingtube_rankings_v001.bin";
-  urlInput.value = GM_getValue(STORAGE_KEY, DEFAULT_DATA_URL);
+  const versionSelect = make('select', 'version-select');
+  versionSelect.id = 'tt-ranking-version';
 
-  const load = make("button", "load", "読込");
-  load.type = "button";
+  const refresh = make('button', '', '履歴を更新');
+  refresh.type = 'button';
 
-  settingsRow.append(urlInput, load);
-  settings.append(label, settingsRow);
+  const selectRow = make('div', 'settings-row');
+  selectRow.append(versionSelect, refresh);
 
-  const results = make("ul", "results");
+  const catalogStatus = make('div', 'catalog-status', '公開されている版を確認中…');
+  catalogStatus.setAttribute('aria-live', 'polite');
 
+  const history = make('ol', 'history');
+  const explanation = make('p', 'note', '収集日はランキングを記録した日です。GitHub追加・最終変更はコミット記録の日時で、収集日とは異なります。');
+
+  const advanced = make('details');
+  advanced.append(make('summary', '', '詳細設定：別のRaw URLを使う'));
+
+  const urlInput = make('input', 'url');
+  urlInput.type = 'url';
+  urlInput.value = choice.url;
+  urlInput.setAttribute('aria-label', 'ランキングデータのGitHub Raw URL');
+
+  const load = make('button', 'load', '読込');
+  load.type = 'button';
+
+  const advancedRow = make('div', 'settings-row');
+  advancedRow.append(urlInput, load);
+  advanced.append(advancedRow);
+
+  settings.append(versionLabel, selectRow, catalogStatus, explanation, history, advanced);
+
+  const results = make('ul', 'results');
   drop.append(head, status, settings, results);
   root.append(searchRow, drop);
   document.body.append(host);
@@ -2552,281 +2512,484 @@ GM_addStyle(String.raw`
     settingsOpen = !settingsOpen;
     settings.hidden = !settingsOpen;
     showDrop();
-    if (settingsOpen) urlInput.focus();
+    if (settingsOpen) {
+      versionSelect.focus();
+      void refreshCatalog().then(() => hydrateDates()).catch(showCatalogError);
+    }
   }
 
   function position() {
-    const found = document.querySelector(
-      "#topbarSearchInput.topbar-search-input"
-    );
-
-    if (
-      !found ||
-      !found.isConnected ||
-      found.getClientRects().length === 0
-    ) {
+    const found = document.querySelector('#topbarSearchInput.topbar-search-input');
+    if (!found?.isConnected || !found.getClientRects().length) {
       anchor = null;
-      host.style.display = "none";
+      host.style.display = 'none';
       hideDrop();
       return;
     }
 
     anchor = found;
-
     const rect = found.getBoundingClientRect();
-    const rightSpace = window.innerWidth - rect.right - 12;
-    const width = Math.min(265, rightSpace - 8);
+    const width = Math.min(265, window.innerWidth - rect.right - 20);
 
-    host.style.position = "fixed";
-    host.style.zIndex = "2147483000";
+    host.style.position = 'fixed';
+    host.style.zIndex = '2147483000';
 
-    if (width >= 160) {
-      host.style.left = `${Math.round(rect.right + 8)}px`;
-      host.style.top = `${Math.round(rect.top)}px`;
-      host.style.width = `${Math.round(width)}px`;
-    } else {
-      host.style.left = `${Math.max(8, Math.round(rect.left))}px`;
-      host.style.top = `${Math.round(rect.bottom + 5)}px`;
-      host.style.width =
-        `${Math.round(Math.min(265, window.innerWidth - rect.left - 12))}px`;
-    }
-
-    host.style.height =
-      `${Math.max(30, Math.round(rect.height))}px`;
-    host.style.display = "block";
+    const left = width >= 160 ? rect.right + 8 : Math.max(8, rect.left);
+    host.style.left = `${Math.round(left)}px`;
+    host.style.top = `${Math.round(width >= 160 ? rect.top : rect.bottom + 5)}px`;
+    host.style.width = `${Math.round(width >= 160 ? width : Math.max(120, Math.min(265, window.innerWidth - left - 12)))}px`;
+    host.style.height = `${Math.max(30, Math.round(rect.height))}px`;
+    host.style.display = 'block';
+    drop.style.right = 'auto';
+    drop.style.left = `${Math.min(0, window.innerWidth - left - Math.min(480, window.innerWidth - 24) - 12)}px`;
+    drop.style.maxHeight = `${Math.max(100, window.innerHeight - parseFloat(host.style.top) - rect.height - 18)}px`;
   }
 
-  function requestBinary(url) {
+  function requestGitHub(url, responseType = 'json') {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:' || !['api.github.com', 'raw.githubusercontent.com'].includes(parsed.hostname)) {
+      return Promise.reject(new Error('対応していないデータ取得先です'));
+    }
+
+    const isAPI = parsed.hostname === 'api.github.com';
+    if (isAPI && Date.now() < apiBlockedUntil) return Promise.reject(new Error('GitHubの取得制限中です。時間をおいて履歴を更新してください。'));
+
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
-        method: "GET",
-        url,
-        responseType: "arraybuffer",
+        method: 'GET',
+        url: parsed.href,
+        responseType,
         timeout: 30000,
-        nocache: true,
         anonymous: true,
-
-        onload: response => response.status === 200
-          ? resolve(response.response)
-          : reject(new Error(`HTTP ${response.status}`)),
-
-        onerror: () => {
-          reject(new Error("通信に失敗しました"));
+        nocache: true,
+        headers: isAPI ? {
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28'
+        } : {},
+        onload: response => {
+          if (response.status !== 200) {
+            if (isAPI && [403, 429].includes(response.status)) {
+              const reset = response.responseHeaders?.match(/^x-ratelimit-reset:\s*(\d+)/im)?.[1];
+              apiBlockedUntil = Math.max(Date.now() + 60 * 1000, reset ? Number(reset) * 1000 : Date.now() + 15 * 60 * 1000);
+            }
+            reject(new Error(isAPI && [403, 429].includes(response.status) ? 'GitHubの取得制限中です。時間をおいて再試行してください。' : `HTTP ${response.status}`));
+            return;
+          }
+          try {
+            const data = responseType === 'json' ?
+              (typeof response.response === 'string' ? JSON.parse(response.response) : response.response ?? JSON.parse(response.responseText)) : response.response;
+            resolve({ data, headers: response.responseHeaders || '' });
+          } catch (_) {
+            reject(new Error('データを読み取れませんでした'));
+          }
         },
-
-        ontimeout: () => {
-          reject(new Error("読込が時間切れになりました"));
-        }
+        onerror: () => reject(new Error('通信に失敗しました')),
+        ontimeout: () => reject(new Error('読込が時間切れになりました'))
       });
     });
   }
 
-  async function loadData() {
-    let address;
+  function catalogFromEntries(entries, source) {
+    if (!Array.isArray(entries)) throw new Error('ランキング一覧の形式が不正です');
+
+    return entries.filter(entry => entry.type === 'file' || entry.type === 'blob').map(entry => {
+      const path = entry.path;
+      if (typeof path !== 'string') return null;
+
+      const slash = path.lastIndexOf('/');
+      if ((slash < 0 ? '' : path.slice(0, slash)) !== source.dir) return null;
+
+      const name = slash < 0 ? path : path.slice(slash + 1);
+      const match = name.match(FILE_PATTERN);
+      if (!match || !Number.isSafeInteger(Number(match[1]))) return null;
+
+      return {
+        name,
+        path,
+        sha: entry.sha,
+        version: Number(match[1]),
+        url: rawFileURL(source, path)
+      };
+    }).filter(Boolean).sort((a, b) => b.version - a.version || a.name.localeCompare(b.name));
+  }
+
+  function renderCatalog() {
+    versionSelect.replaceChildren();
+
+    const latest = make('option', '', catalog.length ? `最新版を自動選択（v${catalog[0].version}）` : '最新版を自動選択');
+    latest.value = 'latest';
+    versionSelect.append(latest);
+
+    for (const file of catalog) {
+      const date = dateCache[`${catalogIdentity}/${file.path}/${file.sha}`]?.added;
+      const option = make('option', '', versionText(file) + (date ? ` ／ 公開 ${dateText(date).split(' ')[0]}` : ''));
+      option.value = file.url;
+      versionSelect.append(option);
+    }
+
+    if (choice.mode !== 'latest' && !catalog.some(file => file.url === choice.url)) {
+      const option = make('option', '', choice.mode === 'custom' ? '個別のURLを使用中' : '保存済みの版（一覧未取得）');
+      option.value = choice.url;
+      versionSelect.append(option);
+    }
+
+    versionSelect.value = choice.mode === 'latest' ? 'latest' : choice.url;
+    history.replaceChildren();
+
+    for (const file of catalog) {
+      const item = make('li', 'history-item');
+      item.dataset.url = file.url;
+      item.classList.toggle('is-selected', loadedURL === file.url);
+
+      const heading = make('div', 'history-header');
+      const button = make('button', '', loadedURL === file.url ? '使用中' : 'この版を使う');
+      button.type = 'button';
+      button.addEventListener('click', () => { void loadData(file.url, 'file'); });
+
+      heading.append(make('strong', '', `バージョン ${file.version}`), button);
+
+      const dates = make('div', 'history-date');
+      dates.dataset.path = file.path;
+
+      item.append(
+        heading,
+        make('div', 'history-file', file.name),
+        make('div', 'history-date', captureText(file)),
+        dates
+      );
+      history.append(item);
+      renderFileDates(file);
+    }
+  }
+
+  function renderFileDates(file, error = '') {
+    const target = Array.from(history.querySelectorAll('[data-path]')).find(element => element.dataset.path === file.path);
+    if (!target) return;
+
+    const info = dateCache[`${catalogIdentity}/${file.path}/${file.sha}`];
+    target.textContent = info ? `GitHub追加：${dateText(info.added)} ／ 最終変更：${dateText(info.updated)}` :
+      error ? `公開日時：${error}` : '公開日時を確認中…';
+  }
+
+  function showCatalogError(error) {
+    catalogStatus.textContent = `履歴の取得に失敗：${error.message}。読込済みのランキングは引き続き検索できます。`;
+  }
+
+  function refreshCatalog(force = false) {
+    if (catalogPromise) return catalogPromise;
+
+    const source = parseRawURL(urlInput.value.trim() || choice.url);
+    const generation = ++catalogGeneration;
+
+    catalogPromise = (async () => {
+      refresh.disabled = true;
+      catalogStatus.textContent = '公開されているランキングの版を確認中…';
+
+      try {
+        const cached = GM_getValue(CATALOG_KEY, null);
+        let files;
+
+        if (!force && cached?.identity === source.identity && Date.now() - cached.time < CACHE_TTL && Array.isArray(cached.files)) {
+          files = cached.files;
+        } else {
+          const dir = source.dir.split('/').filter(Boolean).map(encodeURIComponent).join('/');
+          const result = await requestGitHub(`${apiBase(source)}/contents/${dir}?ref=${encodeURIComponent(source.ref)}`);
+          let entries = result.data;
+
+          if (Array.isArray(entries) && entries.length >= 1000) {
+            const tree = await requestGitHub(`${apiBase(source)}/git/trees/${encodeURIComponent(source.ref)}?recursive=1`);
+            if (tree.data.truncated) throw new Error('ファイルが多いため、全版を確認できませんでした');
+            entries = tree.data.tree;
+          }
+
+          files = catalogFromEntries(entries, source);
+          if (!files.length) throw new Error('このフォルダにランキングの版が見つかりません');
+
+          await safeSave(CATALOG_KEY, {
+            identity: source.identity,
+            time: Date.now(),
+            files
+          });
+        }
+
+        if (generation !== catalogGeneration) return;
+
+        catalog = files;
+        catalogIdentity = source.identity;
+        catalogStatus.textContent = `利用できるランキング：${catalog.length}版（新しい版から表示）`;
+        renderCatalog();
+      } finally {
+        refresh.disabled = false;
+      }
+    })().finally(() => { catalogPromise = null; });
+
+    return catalogPromise;
+  }
+
+  async function fileCommitDates(file, source) {
+    const base = `${apiBase(source)}/commits?sha=${encodeURIComponent(source.ref)}&path=${encodeURIComponent(file.path)}&per_page=1`;
+    const newest = await requestGitHub(base);
+
+    if (!Array.isArray(newest.data) || !newest.data.length) throw new Error('コミット履歴なし');
+
+    const updated = newest.data[0].commit?.committer?.date || newest.data[0].commit?.author?.date;
+    let added = updated;
+    const link = newest.headers.match(/^link:\s*(.+)$/im)?.[1] || '';
+    const last = link.split(',').map(part => part.match(/<([^>]+)>;\s*rel="last"/)).find(Boolean)?.[1];
+
+    if (last) {
+      const lastURL = new URL(last);
+      const expected = new URL(base);
+      if (lastURL.origin !== expected.origin || lastURL.pathname !== expected.pathname) throw new Error('履歴リンクが不正です');
+
+      const oldest = await requestGitHub(lastURL.href);
+      added = oldest.data?.[0]?.commit?.committer?.date || oldest.data?.[0]?.commit?.author?.date;
+    }
+
+    if (!added || !updated) throw new Error('日時が登録されていません');
+    return { added, updated };
+  }
+
+  function hydrateDates() {
+    if (datesPromise) return datesPromise;
+
+    const identity = catalogIdentity;
+    const files = [...catalog];
+    const source = parseRawURL(urlInput.value.trim() || choice.url);
+
+    datesPromise = (async () => {
+      for (const file of files) {
+        if (catalogIdentity !== identity) break;
+
+        const key = `${identity}/${file.path}/${file.sha}`;
+        if (dateCache[key]) {
+          renderFileDates(file);
+          continue;
+        }
+
+        try {
+          dateCache[key] = await fileCommitDates(file, source);
+          await safeSave(DATE_KEY, dateCache);
+          renderFileDates(file);
+        } catch (error) {
+          renderFileDates(file, error.message);
+
+          if (Date.now() < apiBlockedUntil) {
+            for (const remaining of files) {
+              if (!dateCache[`${identity}/${remaining.path}/${remaining.sha}`]) {
+                renderFileDates(remaining, 'GitHubの取得制限中。後で「履歴を更新」を押してください。');
+              }
+            }
+            break;
+          }
+        }
+
+        await new Promise(resolve => window.setTimeout(resolve, 300));
+      }
+
+      if (catalogIdentity === identity) renderCatalogOptions();
+    })().finally(() => { datesPromise = null; });
+
+    return datesPromise;
+  }
+
+  function renderCatalogOptions() {
+    for (const option of versionSelect.options) {
+      const file = catalog.find(entry => entry.url === option.value);
+      if (!file) continue;
+
+      const date = dateCache[`${catalogIdentity}/${file.path}/${file.sha}`]?.added;
+      option.textContent = versionText(file) + (date ? ` ／ 公開 ${dateText(date).split(' ')[0]}` : '');
+    }
+  }
+
+  async function loadData(url, mode = choice.mode) {
+    const generation = ++loadGeneration;
+    const target = url || urlInput.value.trim();
 
     try {
-      address = new URL(urlInput.value.trim());
-
-      if (
-        address.protocol !== "https:" ||
-        address.hostname !== "raw.githubusercontent.com"
-      ) {
-        throw new Error(
-          "raw.githubusercontent.com のURLを入力してください"
-        );
-      }
+      parseRawURL(target);
     } catch (error) {
-      status.textContent = `URLが不正です: ${error.message}`;
+      status.textContent = error.message;
       showDrop();
       return;
     }
 
-    status.textContent = "公開データを読み込み中...";
+    status.textContent = 'ランキングを読み込み中…';
     load.disabled = true;
 
     try {
-      const bytes = await requestBinary(address.href);
+      const { data: bytes } = await requestGitHub(target, 'arraybuffer');
+      if (!(bytes instanceof ArrayBuffer)) throw new Error('不正なバイナリ');
 
-      if (!(bytes instanceof ArrayBuffer)) {
-        throw new Error("不正なバイナリ");
-      }
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+      const data = JSON.parse(await new Response(stream).text());
 
-      const stream = new Blob([bytes])
-        .stream()
-        .pipeThrough(new DecompressionStream("gzip"));
+      if (data.format !== 'typingtube-rankings' || data.version !== 1 || !Array.isArray(data.rows)) throw new Error('対応していないデータ形式です');
+      if (generation !== loadGeneration) return;
 
-      const data = JSON.parse(
-        await new Response(stream).text()
-      );
-
-      if (
-        data.format !== "typingtube-rankings" ||
-        data.version !== 1 ||
-        !Array.isArray(data.rows)
-      ) {
-        throw new Error("対応していないデータ形式です");
-      }
-
-      rows = data.rows.filter(row =>
+      const nextRows = data.rows.filter(row =>
         Array.isArray(row) &&
-        typeof row[0] === "string" &&
+        typeof row[0] === 'string' &&
         Number.isSafeInteger(row[1]) &&
         row[1] > 0
       );
 
-      GM_setValue(STORAGE_KEY, address.href);
+      rows = nextRows;
+      loadedURL = target;
 
-      status.textContent =
-        `${rows.length.toLocaleString()}件の譜面を読み込みました。`;
+      const file = catalog.find(entry => entry.url === target);
+      const match = parseRawURL(target).path.split('/').pop().match(FILE_PATTERN);
+      loadedLabel = file ? versionText(file) : match ? `v${Number(match[1])}` + (target === DEFAULT_DATA_URL ? ' ／ 2026年9月25日収集' : '') : '個別データ';
 
-      settings.hidden = true;
-      settingsOpen = false;
+      choice = { mode, url: target };
+      urlInput.value = target;
 
-      if (query.value.trim()) search();
+      await safeSave(STORAGE_KEY, target);
+      await safeSave(CHOICE_KEY, choice);
+
+      if (generation !== loadGeneration) return;
+      renderCatalog();
+      search();
     } catch (error) {
-      status.textContent = `読込失敗: ${error.message}`;
+      if (generation !== loadGeneration) return;
+
+      status.textContent = `読込失敗：${error.message}` + (rows.length ? `（${loadedLabel}は引き続き検索できます）` : '');
+      renderCatalog();
       showDrop();
     } finally {
-      load.disabled = false;
+      if (generation === loadGeneration) load.disabled = false;
     }
   }
 
   function search() {
     results.replaceChildren();
 
-    const terms = normalize(query.value)
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean);
-
+    const terms = normalize(query.value).trim().split(/\s+/).filter(Boolean);
     if (!terms.length) {
-      if (rows.length) {
-        status.textContent =
-          `${rows.length.toLocaleString()}件を読込済み。曲名を入力してください。`;
-      }
+      if (loadedURL) status.textContent = `${loadedLabel}：${rows.length.toLocaleString()}件。曲名を入力してください。`;
       return;
     }
 
     showDrop();
 
-    if (!rows.length) {
-      status.textContent =
-        "先に⚙から公開データのURLを設定してください。";
+    if (!loadedURL) {
+      status.textContent = 'ランキングを読み込んでから検索できます。⚙で版を選んでください。';
       return;
     }
 
     let total = 0;
 
     for (const [title, id, rank, level] of rows) {
-      if (!terms.every(term => normalize(title).includes(term))) {
-        continue;
-      }
+      if (!terms.every(term => normalize(title).includes(term))) continue;
 
       total++;
       if (total > MAX_RESULTS) continue;
 
-      const item = make("li", "item");
-
-      const info = make(
-        "div",
-        "meta",
+      const item = make('li', 'item');
+      const info = make('div', 'meta',
         `譜面ID: ${id}` +
-        (Number.isInteger(rank) ? ` ／ 順位: ${rank}` : "") +
-        (level ? ` ／ 難易度: ${level}` : "")
+        (Number.isInteger(rank) ? ` ／ 順位: ${rank}` : '') +
+        (level ? ` ／ 難易度: ${level}` : '')
       );
 
-      const actions = make("div", "actions");
+      const actions = make('div', 'actions');
 
-      const link = make("a", "", "譜面を開く");
+      const link = make('a', '', '譜面を開く');
       link.href = `https://typing-tube.net/movie/show/${id}`;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
 
-      const copy = make("button", "copy", "IDをコピー");
-      copy.type = "button";
-
-      copy.addEventListener("click", async () => {
+      const copy = make('button', '', 'IDをコピー');
+      copy.type = 'button';
+      copy.addEventListener('click', async () => {
         try {
           await navigator.clipboard.writeText(String(id));
-          copy.textContent = "コピーしました";
+          copy.textContent = 'コピーしました';
         } catch (_) {
-          copy.textContent = "コピーできませんでした";
+          copy.textContent = 'コピーできませんでした';
         }
       });
 
       actions.append(link, copy);
-      item.append(make("div", "title", title), info, actions);
+      item.append(make('div', 'title', title), info, actions);
       results.append(item);
     }
 
-    status.textContent =
-      `${total}件が一致` +
-      (
-        total > MAX_RESULTS
-          ? `（先頭${MAX_RESULTS}件を表示）`
-          : ""
-      );
+    status.textContent = `${loadedLabel}：${total}件が一致` +
+      (total > MAX_RESULTS ? `（先頭${MAX_RESULTS}件を表示）` : '');
   }
 
-  query.addEventListener("focus", () => {
+  query.addEventListener('focus', () => {
     showDrop();
     if (query.value.trim()) search();
   });
 
-  query.addEventListener("input", search);
+  query.addEventListener('input', search);
 
-  query.addEventListener("keydown", event => {
-    if (event.key === "Enter" || event.key === "Escape") {
+  query.addEventListener('keydown', event => {
+    if (['Enter', 'Escape'].includes(event.key)) {
       event.preventDefault();
       event.stopPropagation();
-
-      if (event.key === "Escape") {
-        hideDrop();
-      } else {
-        search();
-      }
+      if (event.key === 'Escape') hideDrop();
+      else search();
     }
   });
 
-  gear.addEventListener("click", toggleSettings);
-  close.addEventListener("click", hideDrop);
+  gear.addEventListener('click', toggleSettings);
+  close.addEventListener('click', hideDrop);
 
-  load.addEventListener("click", () => {
-    void loadData();
+  load.addEventListener('click', () => {
+    void loadData(urlInput.value.trim(), 'custom');
   });
 
-  urlInput.addEventListener("keydown", event => {
-    if (event.key === "Enter") {
+  urlInput.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
       event.preventDefault();
-      void loadData();
+      void loadData(urlInput.value.trim(), 'custom');
     }
   });
 
-  document.addEventListener("pointerdown", event => {
-    if (open && !host.contains(event.target)) {
-      hideDrop();
+  versionSelect.addEventListener('change', async () => {
+    const value = versionSelect.value;
+    if (value !== 'latest') {
+      await loadData(value, 'file');
+      return;
+    }
+
+    try {
+      await refreshCatalog();
+      if (catalog[0]) await loadData(catalog[0].url, 'latest');
+    } catch (error) {
+      showCatalogError(error);
+      renderCatalog();
     }
   });
 
-  document.addEventListener("keydown", event => {
-    if (event.key === "Escape" && open) {
-      hideDrop();
+  refresh.addEventListener('click', async () => {
+    try {
+      await refreshCatalog(true);
+      if (choice.mode === 'latest' && catalog[0]?.url !== loadedURL) await loadData(catalog[0].url, 'latest');
+      await hydrateDates();
+    } catch (error) {
+      showCatalogError(error);
     }
   });
 
-  window.addEventListener("resize", position);
-  window.addEventListener("scroll", position, true);
+  document.addEventListener('pointerdown', event => {
+    if (open && !host.contains(event.target)) hideDrop();
+  });
+
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && open) hideDrop();
+  });
+
+  window.addEventListener('resize', position);
+  window.addEventListener('scroll', position, true);
+  document.addEventListener('turbo:load', position);
 
   const observer = new MutationObserver(() => {
-    if (
-      !anchor ||
-      !anchor.isConnected ||
-      document.querySelector(
-        "#topbarSearchInput.topbar-search-input"
-      ) !== anchor
-    ) {
-      position();
-    }
+    if (!anchor?.isConnected || document.querySelector('#topbarSearchInput.topbar-search-input') !== anchor) position();
   });
 
   observer.observe(document.documentElement, {
@@ -2834,9 +2997,22 @@ GM_addStyle(String.raw`
     subtree: true
   });
 
+  renderCatalog();
   position();
 
-  if (urlInput.value.trim()) {
-    void loadData();
-  }
+  void (async () => {
+    if (choice.mode !== 'latest') {
+      await loadData(choice.url, choice.mode);
+      return;
+    }
+
+    const generation = loadGeneration;
+    try {
+      await refreshCatalog();
+      if (generation === loadGeneration) await loadData(catalog[0].url, 'latest');
+    } catch (error) {
+      showCatalogError(error);
+      if (generation === loadGeneration) await loadData(choice.url || DEFAULT_DATA_URL, 'latest');
+    }
+  })();
 })();

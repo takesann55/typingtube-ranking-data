@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.0.4
+// @version      8.0.5
 // @description  チャット識別・フォロー・ブロック・コメントリアクション表示切替・オンライン表示・コメントメニュー・入力欄横のフォロー/ブロック一覧・ライブリアクション・ランキング版選択・公開日時付き履歴・曲ID検索
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
@@ -924,54 +924,55 @@ function createUserListsToolbar() {
 }
 
 function editableTextboxRect(input) {
-  if(
-    !input.matches('textarea, input:not([type]), input[type="text"]')||
-    input.disabled||
-    input.readOnly||
-    input.matches(':disabled')||
-    input.closest('.tt-user-popup, #tt-cloud-id-search-v006, [hidden], [inert], [aria-hidden="true"]')
-  )return null;
-
-  const identity=[
-    input.id,
-    input.name,
-    input.className,
-    input.placeholder,
-    input.getAttribute('aria-label'),
-    input.getAttribute('role'),
-    ...Array.from(input.attributes)
-      .filter(attr=>/^data-[\w-]+-target$/.test(attr.name))
-      .map(attr=>attr.value)
-  ].join(' ').replace(/tt-textbox-menu-field/g,'');
-
-  if(
-    /search|query|keyword|filter|検索|絞り込/i.test(identity)||
-    input.closest('[role="search"]')||
-    /search|検索/i.test(input.form?.getAttribute('action')||'')
-  )return null;
-
-  if(!input.isConnected||!input.getClientRects().length)return null;
-
-  const style=window.getComputedStyle(input);
-  if(
-    style.display==='none'||
-    style.visibility==='hidden'||
-    style.visibility==='collapse'||
-    Number(style.opacity)===0
-  )return null;
-
-  const rect=input.getBoundingClientRect();
-  if(rect.width<48||rect.height<20)return null;
-
-  for(let parent=input.parentElement;parent;parent=parent.parentElement){
-    const parentStyle=window.getComputedStyle(parent);
+  if (!input.matches('.room-chat-input, .lobby-chat-input')) return null;
     if(
-      parentStyle.display==='none'||
-      parentStyle.visibility==='hidden'||
-      parentStyle.visibility==='collapse'||
-      Number(parentStyle.opacity)===0
+      !input.matches('textarea, input:not([type]), input[type="text"]')||
+      input.disabled||
+      input.readOnly||
+      input.matches(':disabled')||
+      input.closest('.tt-user-popup, #tt-cloud-id-search-v006, [hidden], [inert], [aria-hidden="true"]')
     )return null;
-  }
+  
+    const identity=[
+      input.id,
+      input.name,
+      input.className,
+      input.placeholder,
+      input.getAttribute('aria-label'),
+      input.getAttribute('role'),
+      ...Array.from(input.attributes)
+        .filter(attr=>/^data-[\w-]+-target$/.test(attr.name))
+        .map(attr=>attr.value)
+    ].join(' ').replace(/tt-textbox-menu-field/g,'');
+  
+    if(
+      /search|query|keyword|filter|検索|絞り込/i.test(identity)||
+      input.closest('[role="search"]')||
+      /search|検索/i.test(input.form?.getAttribute('action')||'')
+    )return null;
+  
+    if(!input.isConnected||!input.getClientRects().length)return null;
+  
+    const style=window.getComputedStyle(input);
+    if(
+      style.display==='none'||
+      style.visibility==='hidden'||
+      style.visibility==='collapse'||
+      Number(style.opacity)===0
+    )return null;
+  
+    const rect=input.getBoundingClientRect();
+    if(rect.width<48||rect.height<20)return null;
+  
+    for(let parent=input.parentElement;parent;parent=parent.parentElement){
+      const parentStyle=window.getComputedStyle(parent);
+      if(
+        parentStyle.display==='none'||
+        parentStyle.visibility==='hidden'||
+        parentStyle.visibility==='collapse'||
+        Number(parentStyle.opacity)===0
+      )return null;
+    }
 
   return rect;
 }

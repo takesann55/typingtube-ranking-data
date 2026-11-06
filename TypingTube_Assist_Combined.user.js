@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.0.5
+// @version      8.0.6
 // @description  チャット識別・フォロー・ブロック・コメントリアクション表示切替・オンライン表示・コメントメニュー・入力欄横のフォロー/ブロック一覧・ライブリアクション・ランキング版選択・公開日時付き履歴・曲ID検索
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
@@ -1063,7 +1063,7 @@ function decorateChatComposers() {
     composerResizeObserver=new ResizeObserver(scheduleComposerMenus);
   }
 
-  for(const input of document.querySelectorAll('textarea, input:not([type]), input[type="text"]')){
+  for(const input of document.querySelectorAll('.room-chat-input, .lobby-chat-input')){
     if(composerMenus.has(input)||!editableTextboxRect(input))continue;
 
     const paddingValue=input.style.getPropertyValue('--tt-textbox-original-padding');

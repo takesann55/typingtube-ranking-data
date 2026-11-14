@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.0.6
-// @description  チャット識別・フォロー・ブロック・コメントリアクション表示切替・オンライン表示・コメントメニュー・入力欄横のフォロー/ブロック一覧・ライブリアクション・ランキング版選択・公開日時付き履歴・曲ID検索
+// @version      8.0.7
+// @description  チャット識別・フォロー・ブロック・コメントリアクション表示切替・オンライン表示・コメントメニュー・入力欄横のフォロー/ブロック一覧・ライブリアクション・ランキング版選択・公開日時付き履歴・曲ID検索・拡張プレイリスト
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
 // @grant        GM_xmlhttpRequest
@@ -2847,4 +2847,611 @@ void(async()=>{
     }
   }
 })();
+})();
+
+(() => {
+  'use strict';
+  if (window.top !== window || document.documentElement.hasAttribute('data-tt-extended-playlist')) return;
+  document.documentElement.setAttribute('data-tt-extended-playlist', '');
+
+  const KEY = 'tt-extended-playlist-v1';
+  const MODAL = '[data-battle-room-target~="songSearchModal"]';
+  const TARGET = name => `[data-battle-room-target~="${name}"]`;
+  const NATIVE_SEARCH = '[data-action~="click->battle-room#switchToSearch"]';
+  const NATIVE_LATER = '[data-action~="click->battle-room#switchToPlayLater"]';
+  const ROOT = '';
+  const UNFILED = '~';
+  const mounted = new Map();
+  let mounting = false;
+  let writes = Promise.resolve();
+
+  GM_addStyle(`
+    .tt-pl-modal:has(.tt-pl-tab.active) :is([data-battle-room-target~="songSearchPane"], [data-battle-room-target~="songSearchStatus"], [data-battle-room-target~="songSearchResults"]) { display: none !important; }
+    .tt-pl-modal:not(:has(.tt-pl-tab.active)) .tt-pl-panel { display: none !important; }
+    .tt-pl-modal .room-search-tabs { flex-wrap: wrap; }
+    .tt-pl-panel { display: grid; gap: .65rem; }
+    .tt-pl-panel-content { display: grid; gap: .55rem; }
+    .tt-pl-panel .tt-pl-toolbar { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
+    .tt-pl-panel .tt-pl-toolbar input[type="search"] { flex: 1 1 10rem; min-width: 0; }
+    .tt-pl-panel .tt-pl-list { max-height: min(48vh, 26rem); overflow: auto; display: grid; gap: .3rem; }
+    .tt-pl-panel .tt-pl-list .room-search-result-row { flex-wrap: wrap; }
+    .tt-pl-panel .tt-pl-list .room-search-result-info { flex: 1 1 8rem; min-width: 0; }
+    .tt-pl-panel .tt-pl-choices label { display: flex; align-items: baseline; gap: .5rem; padding: .25rem; overflow-wrap: anywhere; }
+    .tt-pl-panel .tt-pl-choices input { flex: none; }
+    .tt-pl-panel .tt-pl-btn { cursor: pointer; background: transparent; color: inherit; border: 1px solid currentColor; border-radius: .35rem; padding: .3rem .55rem; font: inherit; text-decoration: none; }
+    .tt-pl-panel .tt-pl-btn:disabled { opacity: .55; cursor: default; }
+    .tt-pl-panel .tt-pl-note { margin: 0; font-size: .85em; overflow-wrap: anywhere; }
+    .tt-pl-panel .tt-pl-status:empty { display: none; }
+    .tt-pl-panel input[type="file"] { display: none; }
+  `);
+
+  function el(tag, cls = '', label) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (label !== undefined) node.textContent = label;
+    return node;
+  }
+
+  function button(label, action, cls = 'tt-pl-btn') {
+    const node = el('button', cls, label);
+    node.type = 'button';
+    if (action) node.addEventListener('click', action);
+    return node;
+  }
+
+  function emptyDb() {
+    return { format: 'tt-extended-playlist', version: 1, folders: [], songs: [] };
+  }
+
+  function textValue(value, limit) {
+    return typeof value === 'string' ? value.trim().slice(0, limit) : '';
+  }
+
+  function movieId(value) {
+    const id = typeof value === 'number' || typeof value === 'string' ? String(value).trim() : '';
+    return /^[1-9]\d{0,14}$/.test(id) ? id : '';
+  }
+
+  function movie(raw) {
+    const id = movieId(raw?.id);
+    if (!id) return null;
+    const vid = textValue(raw.video_id, 30);
+    const level = raw.level == null || raw.level === '' ? NaN : Number(raw.level);
+    return {
+      id,
+      title: textValue(raw.title, 500) || `譜面 ${id}`,
+      channel_name: textValue(raw.channel_name, 200),
+      video_id: /^[A-Za-z0-9_-]{11}$/.test(vid) ? vid : '',
+      level: Number.isFinite(level) && level >= 0 && level <= 100 ? level : null
+    };
+  }
+
+  function validate(raw) {
+    if (raw?.format !== 'tt-extended-playlist' || raw.version !== 1 ||
+        !Array.isArray(raw.folders) || !Array.isArray(raw.songs)) {
+      throw new Error('拡張プレイリストのバックアップ形式を確認してください。');
+    }
+    const folders = new Map();
+    for (const f of raw.folders) {
+      const name = textValue(f?.name, 80);
+      if (!f || typeof f.id !== 'string' || !/^f-[a-zA-Z0-9-]{1,80}$/.test(f.id) ||
+          folders.has(f.id) || !name || typeof f.parent !== 'string') {
+        throw new Error('フォルダの情報が不正です。');
+      }
+      folders.set(f.id, { id: f.id, parent: f.parent, name });
+    }
+    for (const f of folders.values()) {
+      const seen = new Set([f.id]);
+      let parent = f.parent;
+      while (parent !== ROOT) {
+        if (!folders.has(parent) || seen.has(parent)) throw new Error('フォルダの階層が不正です。');
+        seen.add(parent);
+        parent = folders.get(parent).parent;
+      }
+    }
+    const songs = new Map();
+    for (const rawSong of raw.songs) {
+      const song = movie(rawSong);
+      if (!song || songs.has(song.id) || !Array.isArray(rawSong.folders) ||
+          rawSong.folders.some(id => !folders.has(id))) throw new Error('譜面の登録情報が不正です。');
+      songs.set(song.id, { ...song, folders: [...new Set(rawSong.folders)],
+        savedAt: Number.isFinite(rawSong.savedAt) ? rawSong.savedAt : 0 });
+    }
+    return { ...emptyDb(), folders: [...folders.values()], songs: [...songs.values()] };
+  }
+
+  function readDb() {
+    const raw = GM_getValue(KEY, null);
+    return raw === null ? emptyDb() : validate(raw);
+  }
+
+  function change(fn) {
+    const task = writes.then(async () => {
+      const db = readDb();
+      await GM_setValue(KEY, validate(fn(db) ?? db));
+      redrawAll();
+    });
+    writes = task.catch(() => {});
+    return task;
+  }
+
+  function pathOf(db, id) {
+    const names = [];
+    const folders = new Map(db.folders.map(f => [f.id, f]));
+    while (folders.has(id)) {
+      const folder = folders.get(id);
+      names.push(folder.name);
+      id = folder.parent;
+    }
+    return names.reverse().join(' ／ ');
+  }
+
+  function children(db, parent) {
+    return db.folders.filter(f => f.parent === parent).sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+  }
+
+  function sameName(db, parent, name, except) {
+    return db.folders.some(f => f.parent === parent && f.id !== except && f.name === name);
+  }
+
+  function needFolder(db, id) {
+    if (id !== ROOT && !db.folders.some(f => f.id === id)) throw new Error('フォルダが見つかりません。');
+  }
+
+  function say(ctx, message) {
+    ctx.status.textContent = message;
+  }
+
+  function report(ctx, error) {
+    say(ctx, error?.message || '操作に失敗しました。');
+  }
+
+  function act(ctx, fn) {
+    return async event => {
+      try { await fn(event); } catch (error) { report(ctx, error); }
+    };
+  }
+
+  function openFolder(ctx, id) {
+    ctx.folder = id;
+    ctx.query = '';
+    ctx.view = 'browse';
+    redraw(ctx);
+  }
+
+  async function createFolder(ctx) {
+    const name = textValue(window.prompt('新しいフォルダ名（80文字まで）'), 80);
+    if (!name) return;
+    const parent = ctx.folder === UNFILED ? ROOT : ctx.folder;
+    const id = `f-${crypto.randomUUID()}`;
+    await change(db => {
+      needFolder(db, parent);
+      if (sameName(db, parent, name)) throw new Error('同じ場所にその名前のフォルダがあります。');
+      db.folders.push({ id, parent, name });
+    });
+    openFolder(ctx, id);
+    say(ctx, 'フォルダを作成しました。');
+  }
+
+  async function renameFolder(ctx, folder) {
+    const name = textValue(window.prompt('フォルダ名を変更（80文字まで）', folder.name), 80);
+    if (!name || name === folder.name) return;
+    await change(db => {
+      const current = db.folders.find(f => f.id === folder.id);
+      if (!current) throw new Error('フォルダが見つかりません。');
+      if (sameName(db, current.parent, name, current.id)) throw new Error('同じ場所にその名前のフォルダがあります。');
+      current.name = name;
+    });
+    say(ctx, 'フォルダ名を変更しました。');
+  }
+
+  async function deleteFolder(ctx, folder) {
+    if (readDb().folders.some(f => f.parent === folder.id)) {
+      throw new Error('先に子フォルダを移動または削除してください。');
+    }
+    if (!window.confirm(`「${folder.name}」を削除しますか？ 譜面の保存は残ります。`)) return;
+    await change(db => {
+      if (db.folders.some(f => f.parent === folder.id)) throw new Error('子フォルダがあります。');
+      db.folders = db.folders.filter(f => f.id !== folder.id);
+      for (const song of db.songs) song.folders = song.folders.filter(id => id !== folder.id);
+    });
+    openFolder(ctx, folder.parent);
+    say(ctx, 'フォルダを削除しました。');
+  }
+
+  function possibleParent(db, id, candidate) {
+    const byId = new Map(db.folders.map(f => [f.id, f]));
+    while (candidate !== ROOT) {
+      if (candidate === id || !byId.has(candidate)) return false;
+      candidate = byId.get(candidate).parent;
+    }
+    return true;
+  }
+
+  function renderMove(ctx, db, folder) {
+    ctx.content.append(el('p', 'tt-pl-note', `「${folder.name}」の移動先`));
+    const select = el('select', 'form-input');
+    select.setAttribute('aria-label', '移動先フォルダ');
+    for (const id of [ROOT, ...db.folders.map(f => f.id)].filter(id => possibleParent(db, folder.id, id))) {
+      const opt = el('option', '', id === ROOT ? '一番上' : pathOf(db, id));
+      opt.value = id;
+      select.append(opt);
+    }
+    select.value = folder.parent;
+    ctx.content.append(select, button('ここへ移動', act(ctx, async () => {
+      const parent = select.value;
+      await change(current => {
+        const next = current.folders.find(f => f.id === folder.id);
+        if (!next || !possibleParent(current, next.id, parent)) throw new Error('その場所には移動できません。');
+        if (sameName(current, parent, next.name, next.id)) throw new Error('移動先に同じ名前のフォルダがあります。');
+        next.parent = parent;
+      });
+      openFolder(ctx, folder.id);
+      say(ctx, 'フォルダを移動しました。');
+    })));
+  }
+
+  function checkbox(label, checked, onChange) {
+    const node = el('label');
+    const check = el('input');
+    check.type = 'checkbox';
+    check.checked = checked;
+    check.addEventListener('change', () => onChange(check.checked));
+    node.append(check, el('span', '', label));
+    return node;
+  }
+
+  function renderMembership(ctx, db, song) {
+    const chosen = ctx.membership;
+    ctx.content.append(el('p', 'tt-pl-note', `「${song.title}」の登録先（複数選択可）`));
+    const choices = el('div', 'tt-pl-list tt-pl-choices');
+    for (const f of db.folders.slice().sort((a, b) => pathOf(db, a.id).localeCompare(pathOf(db, b.id), 'ja'))) {
+      choices.append(checkbox(pathOf(db, f.id), chosen.has(f.id), on => on ? chosen.add(f.id) : chosen.delete(f.id)));
+    }
+    if (!db.folders.length) choices.append(el('p', 'tt-pl-note', '先に一覧からフォルダを作ってください。'));
+    ctx.content.append(choices, el('p', 'tt-pl-note', 'すべてのチェックを外すと「未分類」になります。'));
+    ctx.content.append(button('登録先を保存', act(ctx, async () => {
+      await change(current => {
+        const target = current.songs.find(s => s.id === song.id);
+        if (!target) throw new Error('この譜面は削除されています。');
+        target.folders = [...chosen].filter(id => current.folders.some(f => f.id === id));
+      });
+      openFolder(ctx, ctx.folder);
+      say(ctx, '登録先を保存しました。');
+    })));
+  }
+
+  async function openImport(ctx) {
+    ctx.view = 'import';
+    ctx.importState = { loading: true, movies: [], selected: new Set(), error: '' };
+    const pending = ctx.importState;
+    redraw(ctx);
+    say(ctx, '標準の「あとでプレイ」を読み込み中…');
+    try {
+      const response = await fetch('/api/play_later', { headers: { Accept: 'application/json' } });
+      if (!response.ok) throw new Error(`標準リストを読み込めませんでした（HTTP ${response.status}）。`);
+      const data = await response.json();
+      if (!Array.isArray(data.movies)) throw new Error('標準リストの形式を確認できませんでした。');
+      pending.movies = [...new Map(data.movies.map(movie).filter(Boolean).map(song => [song.id, song])).values()];
+    } catch (error) {
+      pending.error = error.message || '標準リストを読み込めませんでした。';
+    }
+    pending.loading = false;
+    if (ctx.view !== 'import' || ctx.importState !== pending || !ctx.modal.isConnected) return;
+    redraw(ctx);
+    say(ctx, pending.error);
+  }
+
+  function renderImport(ctx, db) {
+    const state = ctx.importState;
+    const dest = ctx.folder === UNFILED ? ROOT : ctx.folder;
+    ctx.content.append(el('p', 'tt-pl-note', `残したい譜面を選択してください。保存先：${dest ? pathOf(db, dest) : '未分類'}`));
+    if (state.loading) return;
+    if (state.error) {
+      ctx.content.append(button('再読み込み', act(ctx, () => openImport(ctx))));
+      return;
+    }
+    const saved = new Map(db.songs.map(s => [s.id, s]));
+    const choices = el('div', 'tt-pl-list tt-pl-choices');
+    const tools = el('div', 'tt-pl-toolbar');
+    const save = button('選択した譜面を保存', act(ctx, async () => {
+      const selected = state.movies.filter(s => state.selected.has(s.id));
+      if (!selected.length) return;
+      await change(current => {
+        needFolder(current, dest);
+        const known = new Map(current.songs.map(s => [s.id, s]));
+        for (const song of selected) {
+          const old = known.get(song.id);
+          if (old) {
+            if (dest && !old.folders.includes(dest)) old.folders.push(dest);
+          } else {
+            current.songs.push({ ...song, folders: dest ? [dest] : [], savedAt: Date.now() });
+          }
+        }
+      });
+      openFolder(ctx, ctx.folder);
+      say(ctx, `${selected.length}件を保存しました。`);
+    }));
+    const available = state.movies.filter(s => !saved.has(s.id) || (dest && !saved.get(s.id).folders.includes(dest)));
+    const update = () => {
+      save.disabled = !state.selected.size;
+      save.textContent = `選択した${state.selected.size}件を保存`;
+    };
+    for (const s of state.movies) {
+      const existing = saved.get(s.id);
+      const already = !!existing && (!dest || existing.folders.includes(dest));
+      if (already) state.selected.delete(s.id);
+      const row = checkbox(`${s.title}（#${s.id}）${already ? '・保存済み' : ''}`, already || state.selected.has(s.id), on => {
+        if (on) state.selected.add(s.id); else state.selected.delete(s.id);
+        update();
+      });
+      row.querySelector('input').disabled = already;
+      choices.append(row);
+    }
+    if (!state.movies.length) choices.append(el('p', 'tt-pl-note', '現在、標準リストに譜面がありません。'));
+    tools.append(button('未登録を全選択', () => { state.selected = new Set(available.map(s => s.id)); redraw(ctx); }),
+      button('選択を解除', () => { state.selected.clear(); redraw(ctx); }), save);
+    ctx.content.append(tools, choices);
+    update();
+  }
+
+  async function addById(ctx) {
+    const value = window.prompt('譜面ID、または TypingTube の譜面URLを入力してください。');
+    if (value === null) return;
+    let id = movieId(value);
+    if (!id) {
+      const url = new URL(value.trim(), location.origin);
+      if (!['typing-tube.net', 'www.typing-tube.net'].includes(url.hostname) || !/^https?:$/.test(url.protocol)) {
+        throw new Error('TypingTubeの譜面IDまたはURLを入力してください。');
+      }
+      id = movieId(url.pathname.match(/^\/(?:movie\/show|play\/typing)\/(\d+)\/?$/)?.[1]);
+    }
+    if (!id) throw new Error('譜面IDまたはURLを確認してください。');
+    const before = readDb().songs.find(s => s.id === id);
+    const title = before?.title ?? window.prompt('譜面名（空欄ならIDで表示）', '');
+    if (title === null) return;
+    const dest = ctx.folder === UNFILED ? ROOT : ctx.folder;
+    await change(db => {
+      needFolder(db, dest);
+      let target = db.songs.find(s => s.id === id);
+      if (!target) {
+        target = { ...movie({ id, title }), folders: [], savedAt: Date.now() };
+        db.songs.push(target);
+      }
+      if (dest && !target.folders.includes(dest)) target.folders.push(dest);
+    });
+    say(ctx, '譜面を保存しました。');
+  }
+
+  function exportBackup() {
+    const json = JSON.stringify(readDb(), null, 2);
+    const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    const link = el('a');
+    link.href = url;
+    link.download = `typingtube-playlist-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  async function restoreBackup(ctx, file) {
+    if (!file) return;
+    if (file.size > 20 * 1024 * 1024) throw new Error('20 MB以下のバックアップを選んでください。');
+    const restored = validate(JSON.parse(await file.text()));
+    if (!window.confirm(`拡張プレイリストをバックアップで上書きしますか？ 譜面${restored.songs.length}件・フォルダ${restored.folders.length}個`)) return;
+    await change(() => restored);
+    openFolder(ctx, ROOT);
+    say(ctx, 'バックアップを復元しました。');
+  }
+
+  function normalize(value) {
+    return value.normalize('NFKC').toLocaleLowerCase('ja-JP');
+  }
+
+  function songRow(ctx, song, db) {
+    const row = el('div', 'room-search-result-row');
+    if (song.video_id) {
+      const thumb = el('div', 'room-search-result-thumb');
+      const img = el('img');
+      img.src = `https://i.ytimg.com/vi/${song.video_id}/mqdefault.jpg`;
+      img.alt = '';
+      img.loading = 'lazy';
+      thumb.append(img);
+      row.append(thumb);
+    }
+    const info = el('div', 'room-search-result-info');
+    info.append(el('div', 'room-search-result-title', song.title));
+    const meta = el('div', 'room-search-result-meta');
+    if (song.channel_name) meta.append(el('span', '', song.channel_name));
+    if (song.level !== null) meta.append(el('span', '', `Lv.${song.level}`));
+    meta.append(el('span', '', `#${song.id}`));
+    info.append(meta);
+    const folders = song.folders.map(id => pathOf(db, id));
+    info.append(el('div', 'tt-pl-note', folders.length ? folders.join('・') : '未分類'));
+    const propose = button('提案', null, 'room-search-propose-btn');
+    propose.setAttribute('data-action', 'click->battle-room#proposeSongFromSearch');
+    propose.dataset.movieId = song.id;
+    const link = el('a', 'tt-pl-btn', '譜面を開く');
+    link.href = `/movie/show/${song.id}`;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    const actions = el('div', 'tt-pl-toolbar');
+    actions.append(propose, link, button('登録先', () => {
+      ctx.view = 'membership';
+      ctx.songId = song.id;
+      ctx.membership = new Set(song.folders);
+      redraw(ctx);
+    }), button('保存を削除', act(ctx, async () => {
+      if (!window.confirm(`「${song.title}」を拡張プレイリストとすべての登録先から削除しますか？`)) return;
+      await change(current => { current.songs = current.songs.filter(s => s.id !== song.id); });
+      say(ctx, '拡張プレイリストから削除しました。');
+    })));
+    row.append(info, actions);
+    return row;
+  }
+
+  function renderBrowse(ctx, db) {
+    const nav = el('div', 'tt-pl-toolbar');
+    nav.append(button('すべて', () => openFolder(ctx, ROOT)));
+    if (ctx.folder === ROOT || ctx.folder === UNFILED) {
+      nav.append(button('未分類', () => openFolder(ctx, UNFILED)));
+    } else {
+      const trail = [];
+      let folder = db.folders.find(f => f.id === ctx.folder);
+      while (folder) {
+        trail.unshift(folder);
+        folder = db.folders.find(f => f.id === folder.parent);
+      }
+      for (const f of trail) nav.append(button(`／ ${f.name}`, () => openFolder(ctx, f.id)));
+    }
+    ctx.content.append(nav);
+    const controls = el('div', 'tt-pl-toolbar');
+    controls.append(button('新規フォルダ', act(ctx, () => createFolder(ctx))),
+      button('標準リストから取り込む', act(ctx, () => openImport(ctx))),
+      button('ID・URLで保存', act(ctx, () => addById(ctx))));
+    const folder = db.folders.find(f => f.id === ctx.folder);
+    if (folder) controls.append(button('名前を変更', act(ctx, () => renameFolder(ctx, folder))),
+      button('フォルダを移動', () => { ctx.view = 'move'; redraw(ctx); }),
+      button('フォルダを削除', act(ctx, () => deleteFolder(ctx, folder))));
+    ctx.content.append(controls);
+    const childFolders = ctx.folder === UNFILED ? [] : children(db, ctx.folder);
+    if (childFolders.length) {
+      const sub = el('div', 'tt-pl-toolbar');
+      for (const f of childFolders) sub.append(button(`📁 ${f.name}`, () => openFolder(ctx, f.id)));
+      ctx.content.append(sub);
+    }
+    const tools = el('div', 'tt-pl-toolbar');
+    const search = el('input', 'form-input');
+    search.type = 'search';
+    search.placeholder = 'この一覧を曲名・IDで絞り込む';
+    search.setAttribute('aria-label', search.placeholder);
+    search.value = ctx.query;
+    search.addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
+    const count = el('span', 'tt-pl-note');
+    tools.append(search, count);
+    const list = el('div', 'tt-pl-list');
+    const drawSongs = () => {
+      ctx.query = search.value;
+      const words = normalize(ctx.query).trim().split(/\s+/).filter(Boolean);
+      const songs = db.songs.filter(s => (ctx.folder === ROOT ||
+        (ctx.folder === UNFILED ? !s.folders.length : s.folders.includes(ctx.folder))) &&
+        words.every(word => normalize(`${s.title} ${s.channel_name} ${s.id}`).includes(word)))
+        .sort((a, b) => b.savedAt - a.savedAt || a.title.localeCompare(b.title, 'ja'));
+      count.textContent = `${songs.length}件`;
+      list.replaceChildren(...songs.map(song => songRow(ctx, song, db)));
+      if (!songs.length) list.append(el('p', 'tt-pl-note', '表示する譜面がありません。'));
+    };
+    search.addEventListener('input', drawSongs);
+    drawSongs();
+    ctx.content.append(tools, list);
+    const backup = el('div', 'tt-pl-toolbar');
+    const file = el('input');
+    file.type = 'file';
+    file.accept = '.json,application/json';
+    file.addEventListener('change', act(ctx, async () => {
+      const selected = file.files[0];
+      file.value = '';
+      await restoreBackup(ctx, selected);
+    }));
+    backup.append(button('バックアップを書き出す', act(ctx, exportBackup)),
+      button('バックアップから復元', () => file.click()), file);
+    ctx.content.append(backup);
+  }
+
+  function redraw(ctx) {
+    ctx.content.replaceChildren();
+    try {
+      const db = readDb();
+      const folder = db.folders.find(f => f.id === ctx.folder);
+      if (ctx.folder !== ROOT && ctx.folder !== UNFILED && !folder) ctx.folder = ROOT;
+      if (ctx.view === 'membership' && !db.songs.some(s => s.id === ctx.songId)) ctx.view = 'browse';
+      if (ctx.view === 'move' && !folder) ctx.view = 'browse';
+      if (ctx.view !== 'browse') ctx.content.append(button('← 一覧に戻る', () => {
+        openFolder(ctx, ctx.folder);
+        say(ctx, '');
+      }));
+      if (ctx.view === 'import') renderImport(ctx, db);
+      else if (ctx.view === 'membership') renderMembership(ctx, db, db.songs.find(s => s.id === ctx.songId));
+      else if (ctx.view === 'move') renderMove(ctx, db, folder);
+      else renderBrowse(ctx, db);
+    } catch (error) {
+      report(ctx, error);
+    }
+  }
+
+  function redrawAll() {
+    for (const ctx of mounted.values()) if (ctx.modal.isConnected) redraw(ctx);
+  }
+
+  function remove(ctx) {
+    ctx.disconnect?.();
+    if (ctx.tab.classList.contains('active') && ctx.previous?.isConnected) ctx.previous.classList.add('active');
+    ctx.tab.remove();
+    ctx.panel.remove();
+    ctx.modal.classList.remove('tt-pl-modal');
+    mounted.delete(ctx.modal);
+  }
+
+  function mount() {
+    for (const ctx of mounted.values()) {
+      if (!ctx.modal.isConnected || !ctx.tab.isConnected || !ctx.panel.isConnected) remove(ctx);
+    }
+    for (const modal of document.querySelectorAll(MODAL)) {
+      if (mounted.has(modal) || !modal.closest('[data-controller~="battle-room"]')) continue;
+      const tabs = modal.querySelector('.room-search-tabs');
+      const search = tabs?.querySelector(NATIVE_SEARCH);
+      const later = tabs?.querySelector(NATIVE_LATER);
+      const results = modal.querySelector(TARGET('songSearchResults'));
+      if (!search || !later || !results || !modal.querySelector(TARGET('songSearchPane'))) continue;
+      modal.querySelectorAll('.tt-pl-tab, .tt-pl-panel').forEach(node => node.remove());
+      const tab = button('拡張プレイリスト', null, 'room-search-tab tt-pl-tab');
+      const panel = el('section', 'tt-pl-panel');
+      panel.setAttribute('aria-label', '拡張プレイリスト');
+      const status = el('p', 'tt-pl-note tt-pl-status');
+      status.setAttribute('role', 'status');
+      const content = el('div', 'tt-pl-panel-content');
+      panel.append(status, content);
+      tabs.append(tab);
+      results.after(panel);
+      modal.classList.add('tt-pl-modal');
+      const ctx = { modal, tab, panel, status, content, folder: ROOT, view: 'browse', query: '', previous: search };
+      mounted.set(modal, ctx);
+      tab.setAttribute('aria-pressed', 'false');
+      tab.addEventListener('click', () => {
+        ctx.previous = tabs.querySelector('.room-search-tab.active:not(.tt-pl-tab)') || ctx.previous;
+        for (const other of tabs.querySelectorAll('.room-search-tab')) other.classList.toggle('active', other === tab);
+        tab.setAttribute('aria-pressed', 'true');
+        if (!ctx.rendered) { redraw(ctx); ctx.rendered = true; }
+      });
+      const activeObserver = new MutationObserver(() => {
+        const pressed = String(tab.classList.contains('active'));
+        if (tab.getAttribute('aria-pressed') !== pressed) tab.setAttribute('aria-pressed', pressed);
+      });
+      activeObserver.observe(tab, { attributes: true, attributeFilter: ['class'] });
+      ctx.disconnect = () => activeObserver.disconnect();
+    }
+  }
+
+  function scheduleMount() {
+    if (mounting) return;
+    mounting = true;
+    requestAnimationFrame(() => { mounting = false; mount(); });
+  }
+
+  function touchesModal(element) {
+    return element instanceof Element && (element.matches(MODAL) || !!element.querySelector(MODAL) ||
+      element.matches('.room-search-tabs, ' + TARGET('songSearchResults')));
+  }
+
+  new MutationObserver(records => {
+    if (records.some(record => [...record.addedNodes, ...record.removedNodes].some(touchesModal) ||
+      (record.target instanceof Element && record.target.matches(MODAL + ', .room-search-tabs')))) scheduleMount();
+  }).observe(document.documentElement, { childList: true, subtree: true });
+  document.addEventListener('turbo:load', scheduleMount);
+  document.addEventListener('turbo:before-cache', () => {
+    for (const ctx of mounted.values()) remove(ctx);
+  });
+  GM_addValueChangeListener(KEY, (_key, _old, _new, remote) => { if (remote) redrawAll(); });
+  mount();
 })();

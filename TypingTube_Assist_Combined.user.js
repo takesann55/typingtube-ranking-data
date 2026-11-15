@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.1.0
+// @version      8.1.1
 // @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
   if (window.top !== window || document.documentElement.hasAttribute('data-tt-extended-playlist')) return;
-  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.0');
+  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.1');
 
   const KEY = 'tt-extended-playlist-v1';
   const MODAL = '[data-battle-room-target~="songSearchModal"]';
@@ -37,30 +37,34 @@
   const mounted = new Map();
   let serial = 0;
   let activePicker = null;
+  let positioningPicker = false;
   let mounting = false;
   let suspended = false;
   let writes = Promise.resolve();
 
   GM_addStyle(`
     .tt-pl-modal[data-tt-pl-room-open] :is([data-battle-room-target~="songSearchPane"], [data-battle-room-target~="songSearchStatus"], [data-battle-room-target~="songSearchResults"], .room-search-status, .room-search-results) { display: none !important; }
-    .tt-pl-modal .room-search-tabs { flex-wrap: wrap; }
+    .tv-modal-content[data-tt-pl-wide] { box-sizing: border-box; width: min(1200px, calc(100vw - 24px)) !important; max-width: 100% !important; min-width: 0; }
+    .tv-modal-content[data-tt-pl-wide] .tv-modal-body { min-width: 0; }
+    .tt-pl-modal .room-search-tabs { flex-wrap: wrap; min-width: 0; }
+    .tt-pl-modal .room-search-tabs > .room-search-tab { flex: 1 1 0; min-width: 0; white-space: normal; padding-inline: clamp(.25rem, 1vw, .8rem); }
     .tt-pl-standard[data-tt-pl-show-saved] :is([data-play-later-target~="list"], [data-play-later-target~="emptyMsg"], [data-play-later-target~="sortBtn"], [data-play-later-target~="count"], [data-action~="click->play-later#clearAll"], [data-action~="play-later#clearAll"]) { display: none !important; }
     .tt-pl-nav { display: flex; flex-wrap: wrap; gap: .4rem; padding: .45rem .65rem; }
     .tt-pl-tab[aria-pressed="true"], .tt-pl-nav .tt-pl-btn[aria-pressed="true"] { font-weight: 700; }
-    .tt-pl-panel { --tt-pl-line: color-mix(in srgb, currentColor 22%, transparent); --tt-pl-fill: color-mix(in srgb, currentColor 7%, transparent); display: grid; gap: .65rem; min-width: 0; }
+    .tt-pl-panel { --tt-pl-line: color-mix(in srgb, currentColor 22%, transparent); --tt-pl-fill: color-mix(in srgb, currentColor 7%, transparent); display: grid; grid-template-columns: minmax(0, 1fr); gap: .65rem; min-width: 0; }
     .tt-pl-panel[hidden], .tt-pl-panel [hidden] { display: none !important; }
     .tt-pl-panel .tt-pl-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .25rem; padding: .2rem; border-radius: .5rem; background: var(--tt-pl-fill); }
-    .tt-pl-panel .tt-pl-tabs .tt-pl-btn { border-color: transparent; }
+    .tt-pl-panel .tt-pl-tabs .tt-pl-btn { border-color: transparent; min-width: 0; padding-inline: .25rem; }
     .tt-pl-panel .tt-pl-tabs .tt-pl-btn[aria-selected="true"] { border-color: var(--tt-pl-line); background: var(--tt-pl-fill); box-shadow: inset 0 -2px #dc7935; font-weight: 700; }
     .tt-pl-standard .tt-pl-panel, .tt-pl-detail .tt-pl-panel { padding: .6rem; }
     .tt-pl-detail { margin: .45rem 0; }
-    .tt-pl-panel-content { display: grid; gap: .55rem; }
+    .tt-pl-panel-content { display: grid; grid-template-columns: minmax(0, 1fr); gap: .55rem; min-width: 0; }
     .tt-pl-panel .tt-pl-toolbar { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
     .tt-pl-panel .tt-pl-toolbar input[type="search"] { flex: 1 1 10rem; min-width: 0; }
-    .tt-pl-panel .tt-pl-list { max-height: min(48vh, 26rem); overflow: auto; display: grid; gap: .3rem; }
-    .tt-pl-panel .tt-pl-song-list { display: grid; gap: .3rem; }
-    .tt-pl-panel .tt-pl-list .room-search-result-row { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; padding: .4rem; }
-    .tt-pl-panel .tt-pl-list .tt-pl-song-actions { margin-inline-start: auto; }
+    .tt-pl-panel .tt-pl-list { max-height: min(48vh, 26rem); overflow: auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: .3rem; min-width: 0; }
+    .tt-pl-panel .tt-pl-song-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: .3rem; }
+    .tt-pl-panel .tt-pl-list .room-search-result-row { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; padding: .4rem; min-width: 0; }
+    .tt-pl-panel .tt-pl-list .tt-pl-song-actions { min-width: 0; max-width: 100%; margin-inline-start: auto; justify-content: flex-end; }
     .tt-pl-panel .tt-pl-list .room-search-result-info { flex: 1 1 8rem; min-width: 0; }
     .tt-pl-panel .room-search-result-thumb img { display: block; width: 68px; aspect-ratio: 16 / 9; object-fit: cover; }
     .tt-pl-panel .room-search-result-title { overflow-wrap: anywhere; }
@@ -69,6 +73,8 @@
     .tt-pl-panel .tt-pl-choices input { flex: none; }
     :is(.tt-pl-panel, .tt-pl-nav, .tt-pl-detail) .tt-pl-btn { cursor: pointer; background: transparent; color: inherit; border: 1px solid currentColor; border-radius: .35rem; padding: .3rem .55rem; font: inherit; text-decoration: none; }
     .tt-pl-panel .tt-pl-btn:disabled { opacity: .55; cursor: default; }
+    .tt-pl-panel .tt-pl-view-select { appearance: auto; padding: .3rem .35rem; white-space: nowrap; }
+    .tt-pl-panel .tt-pl-view-select option { color: CanvasText; background: Canvas; }
     .tt-pl-panel .tt-pl-btn.tt-pl-icon { display: inline-flex; align-items: center; justify-content: center; gap: .18rem; min-width: 2.1rem; min-height: 2.1rem; border-color: var(--tt-pl-line); padding: .2rem .38rem; }
     .tt-pl-panel .tt-pl-btn.tt-pl-icon:hover, .tt-pl-panel .tt-pl-btn.tt-pl-icon[aria-expanded="true"] { background: var(--tt-pl-fill); border-color: currentColor; }
     .tt-pl-panel .tt-pl-btn.tt-pl-trash:hover { color: var(--danger-color, #dd533e); }
@@ -79,6 +85,13 @@
     .tt-pl-panel .tt-pl-folder-row button { flex: none; }
     .tt-pl-panel .tt-pl-picker { box-sizing: border-box; display: grid; gap: .45rem; flex: 1 1 100%; width: 100%; min-width: 0; padding: .6rem; border: 1px solid var(--tt-pl-line); border-radius: .45rem; background: var(--tt-pl-fill); }
     .tt-pl-panel .tt-pl-picker-children { display: grid; gap: .2rem; max-height: min(28vh, 13rem); overflow: auto; }
+    .tt-pl-panel .tt-pl-picker-nav { display: flex; align-items: center; gap: .45rem; min-width: 0; }
+    .tt-pl-panel .tt-pl-picker-nav button { flex: none; }
+    .tt-pl-panel .tt-pl-picker-path { min-width: 0; overflow-wrap: anywhere; font-weight: 700; }
+    .tt-pl-panel.tt-pl-flyout { position: fixed; inset: auto; z-index: 2147483000; box-sizing: border-box; width: min(320px, calc(100vw - 16px)); min-height: 0; margin: 0; padding: .55rem; gap: .4rem; overflow: auto; align-content: start; border: 1px solid #68646e; border-radius: .55rem; background: #222126; color: #f5f3f6; color-scheme: dark; box-shadow: 0 .35rem 1.2rem #0008; }
+    .tt-pl-panel.tt-pl-flyout[data-tt-pl-above] { transform: translateY(-100%); }
+    .tt-pl-panel.tt-pl-flyout .tt-pl-btn { font-size: .9em; }
+    .tt-pl-panel.tt-pl-flyout .tt-pl-picker-children { max-height: min(30vh, 10rem); }
     .tt-pl-panel .tt-pl-folder-options > summary { cursor: pointer; list-style-position: inside; }
     .tt-pl-panel .tt-pl-folder-options .tt-pl-toolbar { padding-top: .3rem; }
     .tt-pl-panel .tt-pl-more { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(12rem, 100%), 1fr)); gap: .45rem; }
@@ -405,7 +418,20 @@
       const folder = db.folders.find(f => f.id === state.here);
       if (!folder) state.here = ROOT;
       const here = state.here;
-      const open = id => { state.here = id; paint(); };
+      const open = id => {
+        state.here = id;
+        paint();
+        const next = area.querySelector('.tt-pl-picker-back');
+        (next.disabled ? area.querySelector('.tt-pl-folder-row button') || area.querySelector('.tt-pl-picker-save') : next)
+          ?.focus({ preventScroll: true });
+      };
+      const nav = el('div', 'tt-pl-picker-nav');
+      const path = el('span', 'tt-pl-picker-path', pathOf(db, here) || '一番上');
+      path.setAttribute('aria-current', 'location');
+      const back = button('戻す', () => { if (folder) open(folder.parent); }, 'tt-pl-btn tt-pl-picker-back');
+      back.disabled = !folder;
+      back.setAttribute('aria-label', 'ひとつ上の階層に戻す');
+      nav.append(back, path);
       const choices = el('div', 'tt-pl-picker-children tt-pl-choices');
       const summary = el('p', 'tt-pl-note');
       const update = () => {
@@ -435,11 +461,11 @@
           state.saving = save.disabled = false;
           if (kind === 'detail' && ctx.detailPicker === state && !ctx.panel.hidden) redraw(ctx);
         }
-      }));
+      }), 'tt-pl-btn tt-pl-picker-save');
       save.disabled = state.saving;
       controls.append(save, button('閉じる', close));
       update();
-      area.replaceChildren(breadcrumb(db, here, open), choices, summary, controls);
+      area.replaceChildren(nav, choices, summary, controls);
     };
     paint();
   }
@@ -685,11 +711,22 @@
     meta.append(el('span', '', `#${song.id}`));
     info.append(meta);
     const actions = el('div', 'tt-pl-toolbar tt-pl-song-actions');
-    const link = el('a', 'tt-pl-btn', '譜面を開く');
-    link.href = `/movie/show/${song.id}`;
-    link.target = '_blank';
-    link.rel = 'noopener';
-    actions.append(link);
+    const view = el('select', 'tt-pl-btn tt-pl-view-select');
+    view.setAttribute('aria-label', `「${song.title}」の閲覧先`);
+    const options = [['', '閲覧'], [`/movie/show/${song.id}`, '曲ページ'], [`/my/works/${song.id}/edit`, '譜面ページ']];
+    for (const [value, label] of options) {
+      const option = el('option', '', label);
+      option.value = value;
+      option.disabled = !value;
+      view.append(option);
+    }
+    view.value = '';
+    view.addEventListener('change', () => {
+      const path = view.value;
+      view.value = '';
+      if (path && options.some(([value]) => value === path)) window.open(`https://typing-tube.net${path}`, '_blank', 'noopener');
+    });
+    actions.append(view);
     row.append(info, actions);
     return { row, info, actions };
   }
@@ -699,47 +736,84 @@
     const { trigger, popup } = activePicker;
     activePicker = null;
     popup.hidden = true;
-    popup.replaceChildren();
+    popup.remove();
     trigger.setAttribute('aria-expanded', 'false');
-    if (focus) trigger.focus();
+    trigger.removeAttribute('aria-controls');
+    if (focus && trigger.isConnected) trigger.focus({ preventScroll: true });
   }
 
-  function attachSongPicker(ctx, row, actions, song, db, kind, saved) {
-    const popup = el('div', 'tt-pl-picker');
-    popup.id = `${ctx.uid}-picker-${song.id}`;
-    popup.hidden = true;
-    popup.setAttribute('role', 'group');
-    popup.setAttribute('aria-label', `「${song.title}」の登録先`);
+  function positionPicker() {
+    if (!activePicker) return;
+    const { ctx, trigger, popup } = activePicker;
+    if (ctx.panel.hidden || !trigger.isConnected || !trigger.getClientRects().length) { closePicker(ctx); return; }
+    const rect = trigger.getBoundingClientRect();
+    const list = trigger.closest('.tt-pl-list')?.getBoundingClientRect();
+    const w = document.documentElement.clientWidth || window.innerWidth;
+    const h = document.documentElement.clientHeight || window.innerHeight;
+    if (rect.bottom <= 0 || rect.top >= h || rect.right <= 0 || rect.left >= w ||
+        (list && (rect.bottom <= list.top || rect.top >= list.bottom))) { closePicker(ctx); return; }
+    const spaceAbove = rect.top - 14;
+    const spaceBelow = h - rect.bottom - 14;
+    const above = spaceAbove >= 150 || spaceAbove >= spaceBelow;
+    const width = Math.max(0, Math.min(320, w - 16));
+    popup.toggleAttribute('data-tt-pl-above', above);
+    popup.style.width = `${width}px`;
+    popup.style.left = `${Math.max(8, Math.min(rect.right - width, w - width - 8))}px`;
+    popup.style.top = `${above ? rect.top - 6 : rect.bottom + 6}px`;
+    popup.style.maxHeight = `${Math.max(0, Math.min(300, above ? spaceAbove : spaceBelow))}px`;
+  }
+
+  function queuePickerPosition() {
+    if (!activePicker || positioningPicker) return;
+    positioningPicker = true;
+    requestAnimationFrame(() => { positioningPicker = false; positionPicker(); });
+  }
+
+  function attachSongPicker(ctx, actions, song, db, kind, saved) {
+    const popupId = `${ctx.uid}-picker-${song.id}`;
     const trigger = iconButton(`「${song.title}」の登録先を選ぶ`, el('span', '', '📁'), () => {
-      if (!popup.hidden) { closePicker(ctx); return; }
+      if (activePicker?.trigger === trigger) { closePicker(ctx); return; }
       closePicker();
+      const popup = el('div', 'tt-pl-panel tt-pl-flyout');
+      popup.id = popupId;
+      popup.setAttribute('role', 'dialog');
+      popup.setAttribute('aria-label', `「${song.title}」の登録先`);
+      popup.tabIndex = -1;
+      popup.addEventListener('keydown', escape);
       activePicker = { ctx, trigger, popup };
       renderPicker(ctx, popup, db, membershipState(saved, ctx.folder), song, kind, saved, () => closePicker(ctx, true));
       trigger.setAttribute('aria-expanded', 'true');
-      popup.hidden = false;
-      popup.scrollIntoView?.({ block: 'nearest' });
+      trigger.setAttribute('aria-controls', popupId);
+      if (typeof popup.showPopover === 'function') {
+        popup.setAttribute('popover', 'manual');
+        ctx.panel.append(popup);
+        try { popup.showPopover(); } catch {
+          popup.removeAttribute('popover');
+          document.body.append(popup);
+        }
+      } else document.body.append(popup);
+      positionPicker();
+      if (activePicker?.popup === popup) popup.focus({ preventScroll: true });
     });
     const arrow = el('span', '', '▾');
     arrow.setAttribute('aria-hidden', 'true');
     trigger.append(arrow);
-    trigger.setAttribute('aria-controls', popup.id);
+    trigger.setAttribute('aria-haspopup', 'dialog');
     trigger.setAttribute('aria-expanded', 'false');
     const escape = event => {
-      if (event.key !== 'Escape' || popup.hidden) return;
+      if (event.key !== 'Escape' || activePicker?.trigger !== trigger) return;
       event.preventDefault();
       event.stopPropagation();
       closePicker(ctx, true);
     };
     trigger.addEventListener('keydown', escape);
-    popup.addEventListener('keydown', escape);
     actions.append(trigger);
-    row.append(popup);
   }
 
   function songRow(ctx, song, db) {
     const { row, actions } = songCard(song);
     if (ctx.roomId) actions.prepend(proposalButton(ctx, song));
-    attachSongPicker(ctx, row, actions, song, db, 'browse', song);
+    attachSongPicker(ctx, actions, song, db, 'browse', song);
     actions.append(iconButton(`「${song.title}」を拡張プレイリストから削除`, el('i', 'bi bi-trash'), act(ctx, async () => {
       if (!window.confirm(`「${song.title}」を拡張プレイリストとすべての登録先から削除しますか？`)) return;
       await change(current => { current.songs = current.songs.filter(s => s.id !== song.id); });
@@ -806,7 +880,7 @@
         await change(current => { storeSong(current, song, dest); });
         say(ctx, `「${song.title}」を登録しました。`);
       })));
-      attachSongPicker(ctx, row, actions, song, db, 'search', saved);
+      attachSongPicker(ctx, actions, song, db, 'search', saved);
       list.append(row);
     }
     ctx.content.append(list);
@@ -1005,7 +1079,8 @@
     const search = nativeTabs.find(b => hasAction(b, 'battle-room#switchToSearch'));
     const later = nativeTabs.find(b => hasAction(b, 'battle-room#switchToPlayLater'));
     if (!search || !later) return;
-    const host = tabs.closest(MODAL) || tabs.closest('.tv-modal-content') ||
+    const modalContent = tabs.closest('.tv-modal-content');
+    const host = tabs.closest(MODAL) || modalContent ||
       tabs.closest('.tv-modal-body') || tabs.parentElement;
     if (!host) return;
     tabs.querySelectorAll('.tt-pl-tab').forEach(stale => stale.remove());
@@ -1025,12 +1100,17 @@
     tab.setAttribute('aria-pressed', 'false');
     ctx.tab = tab;
     host.classList.add('tt-pl-modal');
+    modalContent?.setAttribute('data-tt-pl-wide', '');
     if (later.parentElement === tabs) later.after(tab);
     else tabs.append(tab);
     ctx.panel.setAttribute('data-tt-pl-room-panel', '');
     tabs.after(ctx.panel);
-    const listener = new MutationObserver(() => showPanel(ctx, tab.classList.contains('active')));
+    const listener = new MutationObserver(() => {
+      if (host.hidden || host.classList.contains('is-hidden')) closePicker(ctx);
+      showPanel(ctx, tab.classList.contains('active'));
+    });
     listener.observe(tab, { attributes: true, attributeFilter: ['class'] });
+    listener.observe(host, { attributes: true, attributeFilter: ['class', 'hidden'] });
     const leave = () => {
       tab.classList.remove('active');
       showPanel(ctx, false);
@@ -1044,6 +1124,7 @@
       if (tab.classList.contains('active') && ctx.previous?.isConnected) ctx.previous.classList.add('active');
       host.removeAttribute('data-tt-pl-room-open');
       host.classList.remove('tt-pl-modal');
+      modalContent?.removeAttribute('data-tt-pl-wide');
     };
   }
 
@@ -1179,6 +1260,8 @@
     suspended = false;
     scheduleMount();
   }, true);
+  document.addEventListener('scroll', queuePickerPosition, { capture: true, passive: true });
+  window.addEventListener('resize', queuePickerPosition);
   for (const event of ['turbo:render', 'turbo:load']) {
     document.addEventListener(event, () => { suspended = false; scheduleMount(); });
   }

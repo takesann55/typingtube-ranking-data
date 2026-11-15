@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.1.1
+// @version      8.1.2
 // @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
   if (window.top !== window || document.documentElement.hasAttribute('data-tt-extended-playlist')) return;
-  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.1');
+  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.2');
 
   const KEY = 'tt-extended-playlist-v1';
   const MODAL = '[data-battle-room-target~="songSearchModal"]';
@@ -73,8 +73,8 @@
     .tt-pl-panel .tt-pl-choices input { flex: none; }
     :is(.tt-pl-panel, .tt-pl-nav, .tt-pl-detail) .tt-pl-btn { cursor: pointer; background: transparent; color: inherit; border: 1px solid currentColor; border-radius: .35rem; padding: .3rem .55rem; font: inherit; text-decoration: none; }
     .tt-pl-panel .tt-pl-btn:disabled { opacity: .55; cursor: default; }
-    .tt-pl-panel .tt-pl-view-select { appearance: auto; padding: .3rem .35rem; white-space: nowrap; }
-    .tt-pl-panel .tt-pl-view-select option { color: CanvasText; background: Canvas; }
+    .tt-pl-panel .tt-pl-select { appearance: auto; padding: .3rem .35rem; white-space: nowrap; max-width: 100%; }
+    .tt-pl-panel .tt-pl-select option { color: CanvasText; background: Canvas; }
     .tt-pl-panel .tt-pl-btn.tt-pl-icon { display: inline-flex; align-items: center; justify-content: center; gap: .18rem; min-width: 2.1rem; min-height: 2.1rem; border-color: var(--tt-pl-line); padding: .2rem .38rem; }
     .tt-pl-panel .tt-pl-btn.tt-pl-icon:hover, .tt-pl-panel .tt-pl-btn.tt-pl-icon[aria-expanded="true"] { background: var(--tt-pl-fill); border-color: currentColor; }
     .tt-pl-panel .tt-pl-btn.tt-pl-trash:hover { color: var(--danger-color, #dd533e); }
@@ -92,8 +92,10 @@
     .tt-pl-panel.tt-pl-flyout[data-tt-pl-above] { transform: translateY(-100%); }
     .tt-pl-panel.tt-pl-flyout .tt-pl-btn { font-size: .9em; }
     .tt-pl-panel.tt-pl-flyout .tt-pl-picker-children { max-height: min(30vh, 10rem); }
-    .tt-pl-panel .tt-pl-folder-options > summary { cursor: pointer; list-style-position: inside; }
-    .tt-pl-panel .tt-pl-folder-options .tt-pl-toolbar { padding-top: .3rem; }
+    .tt-pl-panel .tt-pl-random-folders { min-width: 0; margin: 0; padding: .3rem .55rem; border: 1px solid var(--tt-pl-line); border-radius: .4rem; }
+    .tt-pl-panel .tt-pl-random-folders legend { padding: 0 .25rem; }
+    .tt-pl-panel .tt-pl-random-count { display: inline-flex; gap: .35rem; align-items: center; }
+    .tt-pl-panel .tt-pl-random-count input { box-sizing: border-box; width: 5.5rem; padding: .3rem; }
     .tt-pl-panel .tt-pl-more { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(12rem, 100%), 1fr)); gap: .45rem; }
     .tt-pl-panel .tt-pl-more .tt-pl-btn { text-align: start; }
     .tt-pl-panel .tt-pl-note { margin: 0; font-size: .85em; overflow-wrap: anywhere; }
@@ -711,7 +713,7 @@
     meta.append(el('span', '', `#${song.id}`));
     info.append(meta);
     const actions = el('div', 'tt-pl-toolbar tt-pl-song-actions');
-    const view = el('select', 'tt-pl-btn tt-pl-view-select');
+    const view = el('select', 'tt-pl-btn tt-pl-select tt-pl-view-select');
     view.setAttribute('aria-label', `「${song.title}」の閲覧先`);
     const options = [['', '閲覧'], [`/movie/show/${song.id}`, '曲ページ'], [`/my/works/${song.id}/edit`, '譜面ページ']];
     for (const [value, label] of options) {
@@ -886,26 +888,144 @@
     ctx.content.append(list);
   }
 
+  function folderOperations(ctx, db, folder) {
+    const menu = el('select', 'tt-pl-btn tt-pl-select tt-pl-folder-operations');
+    menu.setAttribute('aria-label', 'フォルダ操作');
+    const choices = [['', 'フォルダ操作'], ['random', 'ランダム選曲…']];
+    if (folder) choices.push(['rename', '名前を変更'], ['move', 'フォルダを移動'], ['delete', 'フォルダを削除']);
+    for (const [value, label] of choices) {
+      const option = el('option', '', label);
+      option.value = value;
+      option.disabled = !value;
+      menu.append(option);
+    }
+    menu.value = '';
+    menu.addEventListener('change', act(ctx, async () => {
+      const op = menu.value;
+      menu.value = '';
+      if (op === 'random') {
+        const here = ctx.folder;
+        const hasChildren = db.folders.some(f => f.parent === here);
+        ctx.randomChoice = { folder: here, selected: new Set(hasChildren ? [] : [here]), count: '1', nested: false, drawn: [] };
+        selectView(ctx, 'random');
+        ctx.content.querySelector('.tt-pl-random-title')?.focus({ preventScroll: true });
+      } else if (folder && op === 'rename') await renameFolder(ctx, folder);
+      else if (folder && op === 'move') {
+        ctx.moveFolder = folder.parent;
+        selectView(ctx, 'move');
+      } else if (folder && op === 'delete') await deleteFolder(ctx, folder);
+    }));
+    return menu;
+  }
+
+  function randomCandidates(db, state) {
+    const wanted = new Set([...state.selected].filter(id => id !== state.folder));
+    if (state.nested && wanted.size) {
+      const tree = new Map();
+      for (const folder of db.folders) {
+        if (!tree.has(folder.parent)) tree.set(folder.parent, []);
+        tree.get(folder.parent).push(folder.id);
+      }
+      for (const id of wanted) for (const child of tree.get(id) || []) wanted.add(child);
+    }
+    if (state.selected.has(state.folder)) wanted.add(state.folder);
+    return db.songs.filter(song => song.folders.length ? song.folders.some(id => wanted.has(id)) : wanted.has(ROOT));
+  }
+
+  function sampleSongs(pool, count) {
+    const chosen = pool.slice();
+    const size = Math.min(count, chosen.length);
+    for (let i = 0; i < size; i++) {
+      const j = i + Math.floor(Math.random() * (chosen.length - i));
+      [chosen[i], chosen[j]] = [chosen[j], chosen[i]];
+    }
+    return chosen.slice(0, size);
+  }
+
+  function renderRandom(ctx, db) {
+    const state = ctx.randomChoice;
+    const folders = children(db, ctx.folder);
+    const visible = new Set([ctx.folder, ...folders.map(folder => folder.id)]);
+    for (const id of state.selected) if (!visible.has(id)) state.selected.delete(id);
+    const heading = el('div', 'tt-pl-toolbar');
+    const title = el('strong', 'tt-pl-random-title', `ランダム選曲：${pathOf(db, ctx.folder) || '一番上'}`);
+    title.tabIndex = -1;
+    heading.append(button('フォルダに戻る', () => selectView(ctx, 'browse')), title);
+    const field = el('fieldset', 'tt-pl-random-folders');
+    const choices = el('div', 'tt-pl-picker-children tt-pl-choices');
+    const addChoice = (id, label) => choices.append(checkbox(label, state.selected.has(id), on => {
+      if (on) state.selected.add(id); else state.selected.delete(id);
+      resetDraw();
+    }));
+    addChoice(ctx.folder, ctx.folder === ROOT ? '一番上の未分類曲' : '現在のフォルダ直下の曲');
+    for (const folder of folders) addChoice(folder.id, folder.name);
+    field.append(el('legend', '', '選曲元'), choices);
+    const nested = checkbox('チェックした子フォルダの下の階層も含める', state.nested, on => { state.nested = on; resetDraw(); });
+    if (folders.length) choices.append(nested);
+    const controls = el('div', 'tt-pl-toolbar');
+    const label = el('label', 'tt-pl-random-count');
+    const number = el('input', 'form-input');
+    number.type = 'number';
+    number.min = '1';
+    number.step = '1';
+    number.value = state.count;
+    number.setAttribute('aria-label', '選曲する曲数');
+    label.append(el('span', '', '曲数'), number);
+    const status = el('p', 'tt-pl-note');
+    status.setAttribute('role', 'status');
+    const list = el('div', 'tt-pl-list');
+    list.setAttribute('role', 'group');
+    list.setAttribute('aria-label', 'ランダム選曲の結果');
+    let pool = [];
+    const draw = act(ctx, () => {
+      if (!pool.length) return;
+      state.count = number.value;
+      const n = Number(state.count);
+      if (!Number.isInteger(n) || n < 1) throw new Error('曲数に1以上の整数を入力してください。');
+      state.drawn = sampleSongs(pool, n).map(song => song.id);
+      say(ctx, '');
+      showResults();
+    });
+    const start = button('ランダム選曲', draw);
+    controls.append(label, start);
+    number.addEventListener('input', () => { state.count = number.value; resetDraw(); });
+    number.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.isComposing) {
+        event.preventDefault();
+        return draw(event);
+      }
+    });
+    function showResults() {
+      const found = new Map(pool.map(song => [song.id, song]));
+      const drawn = state.drawn.map(id => found.get(id)).filter(Boolean);
+      start.disabled = !pool.length;
+      status.textContent = drawn.length ? `候補${pool.length}曲から${drawn.length}曲を選びました。` :
+        !state.selected.size ? '選曲元にチェックを入れてください。' : pool.length ? `候補は${pool.length}曲です。` : '選曲できる曲がありません。';
+      list.replaceChildren(...drawn.map(song => {
+        const { row, actions } = songCard(song);
+        if (ctx.roomId) actions.prepend(proposalButton(ctx, song));
+        return row;
+      }));
+      list.hidden = !drawn.length;
+    }
+    function resetDraw() {
+      say(ctx, '');
+      state.drawn = [];
+      pool = randomCandidates(db, state);
+      showResults();
+    }
+    ctx.content.append(heading, field, controls, status, list);
+    pool = randomCandidates(db, state);
+    showResults();
+  }
+
   function renderBrowse(ctx, db) {
     const open = id => openFolder(ctx, id);
     const folder = db.folders.find(f => f.id === ctx.folder);
     ctx.content.append(breadcrumb(db, ctx.folder, open));
     const controls = el('div', 'tt-pl-toolbar');
     if (folder) controls.append(button('上へ', () => open(folder.parent)));
-    controls.append(button('新規フォルダ', act(ctx, () => createFolder(ctx))));
-    if (folder) {
-      const options = el('details', 'tt-pl-folder-options');
-      const actions = el('div', 'tt-pl-toolbar');
-      actions.append(button('名前を変更', act(ctx, () => renameFolder(ctx, folder))),
-        button('フォルダを移動', () => {
-          ctx.view = 'move';
-          ctx.moveFolder = folder.parent;
-          say(ctx, '');
-          redraw(ctx);
-        }), button('フォルダを削除', act(ctx, () => deleteFolder(ctx, folder))));
-      options.append(el('summary', 'tt-pl-btn', 'フォルダ操作'), actions);
-      controls.append(options);
-    }
+    controls.append(button('新規フォルダ', act(ctx, () => createFolder(ctx))), folderOperations(ctx, db, folder));
     ctx.content.append(controls);
     const childFolders = children(db, ctx.folder);
     const list = el('div', 'tt-pl-list');
@@ -993,8 +1113,8 @@
       }
       const folder = db.folders.find(f => f.id === ctx.folder);
       if (!folder) ctx.folder = ROOT;
-      if (ctx.view === 'move' && !folder) ctx.view = 'browse';
-      const selected = ctx.view === 'import' ? 'more' : ctx.view === 'move' ? 'browse' : ctx.view;
+      if ((ctx.view === 'move' && !folder) || (ctx.view === 'random' && ctx.randomChoice.folder !== ctx.folder)) ctx.view = 'browse';
+      const selected = ctx.view === 'import' ? 'more' : ['move', 'random'].includes(ctx.view) ? 'browse' : ctx.view;
       for (const [view, tab] of ctx.innerTabs) {
         tab.setAttribute('aria-selected', String(view === selected));
         tab.tabIndex = view === selected ? 0 : -1;
@@ -1003,6 +1123,7 @@
       if (ctx.view === 'search') renderSearch(ctx, db);
       else if (selected === 'more') renderMore(ctx, db);
       else if (ctx.view === 'move') renderMove(ctx, db, folder);
+      else if (ctx.view === 'random') renderRandom(ctx, db);
       else renderBrowse(ctx, db);
     } catch (error) {
       report(ctx, error);
@@ -1271,6 +1392,75 @@
   });
   GM_addValueChangeListener(KEY, (_key, _old, _new, remote) => { if (remote) redrawAll(); });
   mount();
+})();
+
+(() => {
+  'use strict';
+  if (window.top !== window) return;
+  const monthly = path => /^\/discover\/monthly\/?$/.test(path);
+  const links = 'nav.pagination-plate a.page-link[href]';
+  const applied = new WeakMap();
+
+  function preserveFilters(nodes) {
+    const current = new URL(location.href);
+    if (!monthly(current.pathname)) return;
+    const carry = current.searchParams;
+    carry.delete('page');
+    const hasFilters = !!carry.toString();
+    for (const node of nodes) {
+      const href = node.getAttribute('href');
+      if (!href || href.startsWith('#')) continue;
+      const before = applied.get(node);
+      const source = before?.next === href ? before.source : href;
+      if (!hasFilters) {
+        applied.delete(node);
+        if (href !== source) node.setAttribute('href', source);
+        continue;
+      }
+      let target;
+      try { target = new URL(source, current.href); } catch { continue; }
+      if (target.origin !== current.origin || !monthly(target.pathname)) continue;
+      const page = target.searchParams.get('page');
+      if (page !== null && !/^[1-9]\d*$/.test(page)) continue;
+      const query = new URLSearchParams(carry);
+      for (const [name, value] of target.searchParams) {
+        if (name !== 'page' && !carry.has(name)) query.append(name, value);
+      }
+      if (page !== null && page !== '1') query.set('page', page);
+      target.search = query.toString();
+      const next = target.pathname + target.search + target.hash;
+      if (next === source) applied.delete(node);
+      else applied.set(node, { source, next });
+      if (next !== href) node.setAttribute('href', next);
+    }
+  }
+
+  const observer = new MutationObserver(records => {
+    const changed = new Set();
+    for (const record of records) {
+      if (record.type === 'attributes') {
+        if (record.target.matches(links)) changed.add(record.target);
+      } else {
+        for (const node of record.addedNodes) {
+          if (!(node instanceof Element)) continue;
+          if (node.matches(links)) changed.add(node);
+          for (const link of node.querySelectorAll(links)) changed.add(link);
+        }
+      }
+    }
+    if (changed.size) preserveFilters(changed);
+  });
+
+  function refresh() {
+    observer.disconnect();
+    if (!monthly(location.pathname)) return;
+    preserveFilters(document.querySelectorAll(links));
+    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['href'] });
+  }
+
+  document.addEventListener('turbo:render', refresh);
+  document.addEventListener('turbo:load', refresh);
+  refresh();
 })();
 
 GM_addStyle(String.raw`

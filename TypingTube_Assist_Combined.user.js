@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.1.3
+// @version      8.1.4
 // @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
@@ -21,9 +21,14 @@
 (() => {
   'use strict';
   if (window.top !== window || document.documentElement.hasAttribute('data-tt-extended-playlist')) return;
-  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.3');
+  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.4');
 
   const KEY = 'tt-extended-playlist-v1';
+  const HISTORY_KEY = 'tt-extended-playlist-proposal-history-v1';
+  const GAP_KEY = 'tt-extended-playlist-proposal-gap-v1';
+  const HISTORY_MAX = 1000;
+  const GAP_DEFAULT = 10;
+  const SEARCH_DELAY = 400;
   const MODAL = '[data-battle-room-target~="songSearchModal"]';
   const TARGET = name => `[data-battle-room-target~="${name}"]`;
   const ROOM_TABS = '.room-search-tabs';
@@ -41,6 +46,10 @@
   let mounting = false;
   let suspended = false;
   let writes = Promise.resolve();
+  let historyWrites = Promise.resolve();
+  let proposalGap = gapValue(GM_getValue(GAP_KEY, GAP_DEFAULT)) ?? GAP_DEFAULT;
+  let proposalHistory = historyValue(GM_getValue(HISTORY_KEY, []));
+  let recentProposals = recentProposalIds();
 
   GM_addStyle(`
     .tt-pl-modal[data-tt-pl-room-open] :is([data-battle-room-target~="songSearchPane"], [data-battle-room-target~="songSearchStatus"], [data-battle-room-target~="songSearchResults"], .room-search-status, .room-search-results) { display: none !important; }
@@ -73,6 +82,7 @@
     .tt-pl-panel .tt-pl-choices input { flex: none; }
     :is(.tt-pl-panel, .tt-pl-nav, .tt-pl-detail) .tt-pl-btn { cursor: pointer; background: transparent; color: inherit; border: 1px solid currentColor; border-radius: .35rem; padding: .3rem .55rem; font: inherit; text-decoration: none; }
     .tt-pl-panel .tt-pl-btn:disabled { opacity: .55; cursor: default; }
+    .tt-pl-panel .tt-pl-song-actions :is(.tt-pl-btn.tt-pl-register, [data-tt-pl-propose]) { box-sizing: border-box; flex: 0 0 4.75em; inline-size: 4.75em; padding-inline: .25em; white-space: nowrap; }
     .tt-pl-panel .tt-pl-select { appearance: auto; padding: .3rem .35rem; white-space: nowrap; max-width: 100%; }
     .tt-pl-panel .tt-pl-select option { color: CanvasText; background: Canvas; }
     .tt-pl-panel .tt-pl-btn.tt-pl-icon { display: inline-flex; align-items: center; justify-content: center; gap: .18rem; min-width: 2.1rem; min-height: 2.1rem; border-color: var(--tt-pl-line); padding: .2rem .38rem; }
@@ -92,10 +102,13 @@
     .tt-pl-panel.tt-pl-flyout[data-tt-pl-above] { transform: translateY(-100%); }
     .tt-pl-panel.tt-pl-flyout .tt-pl-btn { font-size: .9em; }
     .tt-pl-panel.tt-pl-flyout .tt-pl-picker-children { max-height: min(30vh, 10rem); }
-    .tt-pl-panel .tt-pl-random-folders { min-width: 0; margin: 0; padding: .3rem .55rem; border: 1px solid var(--tt-pl-line); border-radius: .4rem; }
-    .tt-pl-panel .tt-pl-random-folders legend { padding: 0 .25rem; }
+    .tt-pl-panel .tt-pl-random-panel { display: grid; gap: .4rem; min-width: 0; padding: .5rem .6rem; border: 1px solid var(--tt-pl-line); border-radius: .4rem; }
+    .tt-pl-panel .tt-pl-random-check { display: inline-flex; align-items: center; gap: .35rem; min-width: 0; overflow-wrap: anywhere; }
+    .tt-pl-panel .tt-pl-random-check input { flex: none; }
     .tt-pl-panel .tt-pl-random-count { display: inline-flex; gap: .35rem; align-items: center; }
     .tt-pl-panel .tt-pl-random-count input { box-sizing: border-box; width: 5.5rem; padding: .3rem; }
+    .tt-pl-panel .tt-pl-history summary { cursor: pointer; }
+    .tt-pl-panel .tt-pl-history ol { max-height: 9rem; overflow: auto; margin-block: .2rem; overflow-wrap: anywhere; }
     .tt-pl-panel .tt-pl-more { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(12rem, 100%), 1fr)); gap: .45rem; }
     .tt-pl-panel .tt-pl-more .tt-pl-btn { text-align: start; }
     .tt-pl-panel .tt-pl-note { margin: 0; font-size: .85em; overflow-wrap: anywhere; }
@@ -286,7 +299,53 @@
     };
   }
 
+  function gapValue(value) {
+    if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '') return null;
+    const n = Number(value);
+    return Number.isInteger(n) && n >= 0 && n <= HISTORY_MAX ? n : null;
+  }
+
+  function historyValue(value) {
+    return !Array.isArray(value) ? [] : value.slice(-HISTORY_MAX).flatMap(entry => {
+      const id = movieId(entry?.id);
+      return id ? [{ id, title: textValue(entry.title, 500) || `譜面 ${id}` }] : [];
+    });
+  }
+
+  function recentProposalIds() {
+    return new Set(proposalGap > 0 ? proposalHistory.slice(-proposalGap).map(song => song.id) : []);
+  }
+
+  function refreshHistory(gapChanged = false) {
+    recentProposals = recentProposalIds();
+    for (const ctx of mounted.values()) {
+      if (ctx.roomId) syncProposalButtons(ctx);
+      if (ctx.view === 'browse') ctx.randomChoice?.syncHistory?.(gapChanged);
+    }
+  }
+
+  function setGap(value) {
+    const gap = gapValue(value);
+    if (gap === null) throw new Error(`重複を避ける曲数は0〜${HISTORY_MAX}の整数を入力してください。`);
+    if (proposalGap === gap) return;
+    GM_setValue(GAP_KEY, gap);
+    proposalGap = gap;
+    refreshHistory(true);
+  }
+
+  function recordProposal(song) {
+    const task = historyWrites.then(async () => {
+      const history = historyValue(GM_getValue(HISTORY_KEY, proposalHistory));
+      proposalHistory = [...history, { id: song.id, title: song.title }].slice(-HISTORY_MAX);
+      refreshHistory();
+      await GM_setValue(HISTORY_KEY, proposalHistory);
+    });
+    historyWrites = task.catch(error => console.warn('提案履歴を保存できませんでした。', error));
+    return historyWrites;
+  }
+
   function openFolder(ctx, id) {
+    stopSearch(ctx);
     stopRandomBatch(ctx);
     ctx.folder = id;
     ctx.query = '';
@@ -626,11 +685,13 @@
   }
 
   function paintProposalButton(ctx, target, id) {
-    const state = ctx.proposals.get(id);
+    const pending = ctx.proposals.has(id);
+    const recent = recentProposals.has(id);
     const waiting = ctx.randomBatch && !ctx.randomBatch.cancelled && ctx.randomBatch.waiting.has(id);
-    target.disabled = !!state || !!ctx.randomBatch;
-    target.classList.toggle('proposed', state === 'done');
-    target.textContent = state === 'pending' ? '提案中…' : state === 'done' ? '提案済み' : waiting ? '提案待ち' : '提案';
+    target.disabled = pending || recent || !!ctx.randomBatch;
+    target.classList.toggle('proposed', recent && !pending);
+    target.textContent = pending ? '提案中…' : recent ? '提案済み' : waiting ? '提案待ち' : '提案';
+    target.title = recent ? `直近${proposalGap}曲の提案履歴にあります` : '';
   }
 
   function syncProposalButtons(ctx, id) {
@@ -639,7 +700,7 @@
   }
 
   async function proposeSong(ctx, song, batch) {
-    if ((ctx.randomBatch && ctx.randomBatch !== batch) || ctx.proposals.has(song.id)) return false;
+    if ((ctx.randomBatch && ctx.randomBatch !== batch) || ctx.proposals.has(song.id) || recentProposals.has(song.id)) return false;
     const endpoint = requireRoom(ctx);
     const csrf = document.querySelector('meta[name="csrf-token"]')?.content;
     if (!csrf) throw new Error('提案するには、ログインした状態でページを読み直してください。');
@@ -664,13 +725,11 @@
           (Array.isArray(error?.errors) ? error.errors.filter(e => typeof e === 'string').join('・').slice(0, 500) : '');
         throw new Error(message || `提案できませんでした（HTTP ${response.status}）。`);
       }
-      ctx.proposals.set(song.id, 'done');
+      await recordProposal(song);
       if (!batch) say(ctx, `「${song.title}」を提案しました。`);
       return true;
-    } catch (error) {
-      ctx.proposals.delete(song.id);
-      throw error;
     } finally {
+      ctx.proposals.delete(song.id);
       syncProposalButtons(ctx, song.id);
     }
   }
@@ -828,31 +887,79 @@
     return row;
   }
 
-  async function runSearch(ctx, value) {
+  function searchOpen(ctx) {
+    return ctx.view === 'search' && ctx.panel.isConnected && !ctx.panel.hidden &&
+      !ctx.host.hidden && !ctx.host.classList.contains('is-hidden');
+  }
+
+  function clearSearchTimer(ctx) {
+    if (!ctx.searchUI || ctx.searchUI.timer === null) return;
+    clearTimeout(ctx.searchUI.timer);
+    ctx.searchUI.timer = null;
+  }
+
+  function stopSearch(ctx) {
+    clearSearchTimer(ctx);
+    if (ctx.searchUI?.composing) {
+      ctx.searchUI.composing = false;
+      ctx.searchUI.input.value = ctx.searchText;
+    }
+    if (!ctx.remote?.loading) return;
+    const prev = ctx.remote;
+    ctx.remote = null;
+    prev.request.abort();
+  }
+
+  function scheduleSearch(ctx) {
+    const ui = ctx.searchUI;
+    if (!searchOpen(ctx) || !ui || ui.composing) return;
+    clearSearchTimer(ctx);
+    const value = ctx.searchText.trim();
+    if (ctx.remote?.label === value) return;
+    ctx.remote?.request.abort();
+    ctx.remote = null;
+    say(ctx, '');
+    if (value) ui.timer = setTimeout(act(ctx, () => runSearch(ctx)), SEARCH_DELAY);
+    redraw(ctx);
+  }
+
+  function resumeSearch(ctx) {
+    if (ctx.searchUI?.timer === null && !ctx.remote && ctx.searchText.trim()) scheduleSearch(ctx);
+  }
+
+  async function runSearch(ctx, manual = false) {
+    const ui = ctx.searchUI;
+    clearSearchTimer(ctx);
+    if (!searchOpen(ctx) || !ui || ui.composing) return;
+    ctx.searchText = ui.input.value;
+    const value = ctx.searchText.trim();
     if (!value) {
-      say(ctx, '曲名・URL・譜面IDのいずれかを入力してください。');
+      ctx.remote?.request.abort();
+      ctx.remote = null;
+      redraw(ctx);
+      if (manual) say(ctx, '曲名・URL・譜面IDのいずれかを入力してください。');
       return;
     }
+    if (ctx.remote?.label === value && (ctx.remote.loading || !manual)) return;
     const query = linkedMovieId(value) || movieId(value.normalize('NFKC')) || value;
-    ctx.remote?.request?.abort();
+    ctx.remote?.request.abort();
     const state = { label: value, movies: [], request: new AbortController(), loading: true };
     ctx.remote = state;
-    ctx.searchText = value;
     say(ctx, '');
     redraw(ctx);
     try {
       state.movies = await searchSongs(ctx, query, state.request.signal);
     } catch (error) {
-      if (error.name === 'AbortError') return;
-      state.error = error.message || '曲を検索できませんでした。';
+      if (error?.name === 'AbortError') return;
+      state.error = error?.message || '曲を検索できませんでした。';
     } finally {
       state.loading = false;
     }
-    if (ctx.remote !== state || ctx.view !== 'search' || !ctx.panel.isConnected) return;
+    if (ctx.remote !== state || !searchOpen(ctx)) return;
     redraw(ctx);
   }
 
-  function renderSearch(ctx, db) {
+  function makeSearchUI(ctx) {
     const bar = el('div', 'tt-pl-toolbar');
     bar.setAttribute('role', 'search');
     const input = el('input', 'form-input');
@@ -860,66 +967,54 @@
     input.placeholder = '曲名・URL・譜面IDで検索';
     input.setAttribute('aria-label', '曲名・URL・譜面IDの検索');
     input.value = ctx.searchText;
-    input.addEventListener('input', () => { ctx.searchText = input.value; });
-    const submit = () => runSearch(ctx, input.value.trim());
+    const ui = { bar, input, destination: el('p', 'tt-pl-note'), status: el('p', 'tt-pl-note'), list: el('div', 'tt-pl-list'), timer: null, composing: false };
+    ui.status.setAttribute('role', 'status');
+    const changed = () => {
+      ctx.searchText = input.value;
+      scheduleSearch(ctx);
+    };
+    input.addEventListener('compositionstart', () => {
+      ui.composing = true;
+      clearSearchTimer(ctx);
+    });
+    input.addEventListener('compositionend', () => { ui.composing = false; changed(); });
+    input.addEventListener('input', event => { if (!ui.composing && !event.isComposing) changed(); });
+    const submit = () => runSearch(ctx, true);
     input.addEventListener('keydown', act(ctx, event => {
-      if (event.isComposing || event.key !== 'Enter') return;
+      if (ui.composing || event.isComposing || event.keyCode === 229 || event.key !== 'Enter') return;
       event.preventDefault();
       return submit();
     }));
     bar.append(input, button('曲を検索', act(ctx, submit)));
-    const dest = ctx.folder;
-    ctx.content.append(bar, el('p', 'tt-pl-note', `登録先：${dest ? pathOf(db, dest) : '未分類'}。📁から別の場所も選べます。`));
-    const { label, movies, error, loading } = ctx.remote || {};
-    const result = el('p', 'tt-pl-note', !movies ? '曲名や譜面IDで探して、見つかった曲を登録できます。' : loading ? '曲を検索中…' : error || `「${label}」の検索結果：${movies.length}件`);
-    result.setAttribute('role', 'status');
-    ctx.content.append(result);
-    if (!movies?.length || loading || error) return;
-    const list = el('div', 'tt-pl-list');
-    const savedSongs = new Map(db.songs.map(song => [song.id, song]));
-    for (const song of movies) {
-      const { row, info, actions } = songCard(song);
-      const saved = savedSongs.get(song.id);
-      if (ctx.roomId) actions.prepend(proposalButton(ctx, song));
-      if (saved && (!dest || saved.folders.includes(dest))) info.append(el('span', 'tt-pl-note', '登録済み'));
-      else actions.append(button('登録', act(ctx, async () => {
-        await change(current => { storeSong(current, song, dest); });
-        say(ctx, `「${song.title}」を登録しました。`);
-      })));
-      attachSongPicker(ctx, actions, song, db, 'search', saved);
-      list.append(row);
-    }
-    ctx.content.append(list);
+    return ui;
   }
 
-  function folderOperations(ctx, db, folder) {
-    const menu = el('select', 'tt-pl-btn tt-pl-select tt-pl-folder-operations');
-    menu.setAttribute('aria-label', 'フォルダ操作');
-    const choices = [['', 'フォルダ操作'], ['random', 'ランダム選曲…']];
-    if (folder) choices.push(['rename', '名前を変更'], ['move', 'フォルダを移動'], ['delete', 'フォルダを削除']);
-    for (const [value, label] of choices) {
-      const option = el('option', '', label);
-      option.value = value;
-      option.disabled = !value;
-      menu.append(option);
+  function renderSearch(ctx, db) {
+    const ui = ctx.searchUI ||= makeSearchUI(ctx);
+    if (ui.bar.parentElement !== ctx.content) ctx.content.replaceChildren(ui.bar, ui.destination, ui.status, ui.list);
+    const dest = ctx.folder;
+    ui.destination.textContent = `登録先：${dest ? pathOf(db, dest) : '未分類'}。📁から別の場所も選べます。`;
+    const { label, movies, error, loading } = ctx.remote || {};
+    ui.status.textContent = ui.timer !== null ? '入力が止まったら検索します…' : !movies ?
+      '曲名や譜面IDを入力すると自動で検索します。' : loading ? '曲を検索中…' : error || `「${label}」の検索結果：${movies.length}件`;
+    ui.list.replaceChildren();
+    ui.list.hidden = !movies?.length || loading || !!error;
+    if (ui.list.hidden) return;
+    const savedSongs = new Map(db.songs.map(song => [song.id, song]));
+    for (const song of movies) {
+      const { row, actions } = songCard(song);
+      const saved = savedSongs.get(song.id);
+      if (ctx.roomId) actions.prepend(proposalButton(ctx, song));
+      const registered = !!saved && (!dest || saved.folders.includes(dest));
+      const register = button(registered ? '登録済み' : '登録', registered ? null : act(ctx, async () => {
+        await change(current => { storeSong(current, song, dest); });
+        say(ctx, `「${song.title}」を登録しました。`);
+      }), 'tt-pl-btn tt-pl-register');
+      register.disabled = registered;
+      actions.append(register);
+      attachSongPicker(ctx, actions, song, db, 'search', saved);
+      ui.list.append(row);
     }
-    menu.value = '';
-    menu.addEventListener('change', act(ctx, async () => {
-      const op = menu.value;
-      menu.value = '';
-      if (op === 'random') {
-        const here = ctx.folder;
-        const hasChildren = db.folders.some(f => f.parent === here);
-        ctx.randomChoice = { folder: here, selected: new Set(hasChildren ? [] : [here]), count: '1', nested: false, drawn: [] };
-        selectView(ctx, 'random');
-        ctx.content.querySelector('.tt-pl-random-title')?.focus({ preventScroll: true });
-      } else if (folder && op === 'rename') await renameFolder(ctx, folder);
-      else if (folder && op === 'move') {
-        ctx.moveFolder = folder.parent;
-        selectView(ctx, 'move');
-      } else if (folder && op === 'delete') await deleteFolder(ctx, folder);
-    }));
-    return menu;
   }
 
   function randomCandidates(db, state) {
@@ -947,7 +1042,7 @@
   }
 
   function batchStatus(ctx, batch, message) {
-    if (ctx.view === 'random' && ctx.randomChoice === batch.choice && ctx.panel.isConnected) say(ctx, message);
+    if (ctx.view === 'browse' && ctx.randomChoice === batch.choice && ctx.panel.isConnected) say(ctx, message);
   }
 
   function stopRandomBatch(ctx, announce = false) {
@@ -969,13 +1064,13 @@
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       for (const [index, song] of batch.songs.entries()) {
         if (batch.cancelled || ctx.panel.hidden || !ctx.panel.isConnected || ctx.host.hidden ||
-            ctx.host.classList.contains('is-hidden') || ctx.view !== 'random' || ctx.randomChoice !== batch.choice ||
+            ctx.host.classList.contains('is-hidden') || ctx.view !== 'browse' || ctx.randomChoice !== batch.choice ||
             roomIdFor(ctx.host) !== ctx.roomId) {
           batch.cancelled = true;
           break;
         }
         batch.waiting.delete(song.id);
-        if (ctx.proposals.has(song.id)) { skipped++; continue; }
+        if (ctx.proposals.has(song.id) || recentProposals.has(song.id)) { skipped++; continue; }
         batchStatus(ctx, batch, `${index + 1}/${total}曲目を提案中：${song.title}（送信済み${sent}曲）`);
         try {
           if (await proposeSong(ctx, song, batch)) sent++;
@@ -997,31 +1092,36 @@
     }
   }
 
-  function renderRandom(ctx, db) {
+  function renderRandom(ctx, db, folders) {
+    if (ctx.randomChoice?.folder !== ctx.folder) {
+      ctx.randomChoice = { folder: ctx.folder, selected: new Set([ctx.folder]), count: '1', nested: false, auto: false, drawn: [] };
+    }
     const state = ctx.randomChoice;
-    const folders = children(db, ctx.folder);
     const visible = new Set([ctx.folder, ...folders.map(folder => folder.id)]);
     for (const id of state.selected) if (!visible.has(id)) state.selected.delete(id);
-    const heading = el('div', 'tt-pl-toolbar');
-    const title = el('strong', 'tt-pl-random-title', `ランダム選曲：${pathOf(db, ctx.folder) || '一番上'}`);
-    title.tabIndex = -1;
-    heading.append(button('フォルダに戻る', () => selectView(ctx, 'browse')), title);
-    const field = el('fieldset', 'tt-pl-random-folders');
-    const choices = el('div', 'tt-pl-picker-children tt-pl-choices');
-    const addChoice = (id, label) => choices.append(checkbox(label, state.selected.has(id), on => {
-      if (ctx.randomBatch) return;
-      if (on) state.selected.add(id); else state.selected.delete(id);
-      resetDraw();
-    }));
-    addChoice(ctx.folder, ctx.folder === ROOT ? '一番上の未分類曲' : '現在のフォルダ直下の曲');
-    for (const folder of folders) addChoice(folder.id, folder.name);
-    field.append(el('legend', '', '選曲元'), choices);
-    const nested = checkbox('チェックした子フォルダの下の階層も含める', state.nested, on => {
-      if (ctx.randomBatch) return;
+    const panel = el('section', 'tt-pl-random-panel');
+    panel.setAttribute('aria-label', 'ランダム選曲');
+    const choices = el('div', 'tt-pl-toolbar');
+    const checks = [];
+    function choice(label, checked, update) {
+      const node = checkbox(label, checked, on => { if (!ctx.randomBatch) update(on); });
+      node.className = 'tt-pl-random-check';
+      const input = node.querySelector('input');
+      checks.push(input);
+      input.disabled = !!ctx.randomBatch;
+      return node;
+    }
+    function sourceLabel(id, label) {
+      return choice(label, state.selected.has(id), on => {
+        if (on) state.selected.add(id); else state.selected.delete(id);
+        resetDraw();
+      });
+    }
+    choices.append(sourceLabel(ctx.folder, ctx.folder === ROOT ? '一番上の未分類曲' : '現在のフォルダ直下の曲'));
+    if (folders.length) choices.append(choice('チェックした子フォルダの下の階層も含める', state.nested, on => {
       state.nested = on;
       resetDraw();
-    });
-    if (folders.length) choices.append(nested);
+    }));
     const controls = el('div', 'tt-pl-toolbar');
     const label = el('label', 'tt-pl-random-count');
     const number = el('input', 'form-input');
@@ -1031,32 +1131,52 @@
     number.value = state.count;
     number.setAttribute('aria-label', '選曲する曲数');
     label.append(el('span', '', '曲数'), number);
+    const settings = el('label', 'tt-pl-random-count');
+    const gap = el('input', 'form-input');
+    gap.type = 'number';
+    gap.min = '0';
+    gap.max = String(HISTORY_MAX);
+    gap.step = '1';
+    gap.value = String(proposalGap);
+    gap.setAttribute('aria-label', '直近の提案から除外する曲数');
+    gap.addEventListener('change', act(ctx, () => { if (!ctx.randomBatch) setGap(gap.value); }));
+    settings.append(el('span', '', '直近の提案から除外'), gap, el('span', '', '曲'));
+    const history = el('details', 'tt-pl-history');
+    const historyTitle = el('summary', 'tt-pl-note');
+    const historyList = el('ol', 'tt-pl-note');
+    history.append(historyTitle, historyList);
+    history.addEventListener('toggle', updateHistoryList);
     const status = el('p', 'tt-pl-note');
     status.setAttribute('role', 'status');
     const list = el('div', 'tt-pl-list');
     list.setAttribute('role', 'group');
     list.setAttribute('aria-label', 'ランダム選曲の結果');
+    const drawnNote = el('p', 'tt-pl-note');
     let pool = [];
     const draw = act(ctx, async () => {
-      if (ctx.randomBatch || !pool.length) return;
+      if (ctx.randomBatch) return;
+      setGap(gap.value);
+      if (!pool.length) return;
       state.count = number.value;
       const n = Number(state.count);
       if (!Number.isInteger(n) || n < 1) throw new Error('曲数に1以上の整数を入力してください。');
-      if (ctx.roomId && [...ctx.proposals.values()].includes('pending')) throw new Error('送信中の提案が完了してからもう一度押してください。');
+      const send = ctx.roomId && state.auto;
+      if (send && ctx.proposals.size) throw new Error('送信中の提案が完了してからもう一度押してください。');
       state.drawn = sampleSongs(pool, n);
       say(ctx, '');
-      const batch = ctx.roomId ? { choice: state, songs: state.drawn, waiting: new Set(state.drawn.map(song => song.id)), cancelled: false } : null;
+      const batch = send ? { choice: state, songs: state.drawn, waiting: new Set(state.drawn.map(song => song.id)), cancelled: false } : null;
       if (batch) ctx.randomBatch = batch;
       showResults();
       if (batch) await runRandomBatch(ctx, batch);
     });
-    const start = button(ctx.roomId ? 'ランダム選曲して自動提案' : 'ランダム選曲', draw);
+    const start = button('ランダム選曲', draw);
     const stop = button('残りを停止', () => stopRandomBatch(ctx, true));
     controls.append(label, start);
-    if (ctx.roomId) controls.append(stop);
+    if (ctx.roomId) controls.append(choice('自動で提案', state.auto, on => { state.auto = on; }), stop);
     state.syncControls = () => {
       const batch = ctx.randomBatch;
-      field.disabled = number.disabled = !!batch;
+      number.disabled = gap.disabled = !!batch;
+      for (const input of checks) input.disabled = !!batch;
       start.disabled = !pool.length || !!batch;
       stop.hidden = !batch;
       stop.disabled = !!batch?.cancelled;
@@ -1072,27 +1192,44 @@
         return draw(event);
       }
     });
+    function updateHistoryList() {
+      historyTitle.textContent = proposalHistory.length ? `提案履歴（最近${Math.min(20, proposalHistory.length)}曲を表示）` : '提案履歴（まだありません）';
+      if (history.open) historyList.replaceChildren(...proposalHistory.slice(-20).reverse().map(song => el('li', '', `${song.title}（#${song.id}）`)));
+    }
+    state.syncHistory = (gapChanged = false) => {
+      if (gapChanged) gap.value = String(proposalGap);
+      const eligible = randomCandidates(db, state);
+      pool = eligible.filter(song => !recentProposals.has(song.id));
+      const excluded = eligible.length - pool.length;
+      status.textContent = !state.selected.size ? '選曲元にチェックを入れてください。' : (pool.length ? `候補は${pool.length}曲です。` : '選曲できる曲がありません。') +
+        (excluded ? ` 最近の提案履歴から${excluded}曲を除外しました。` : '');
+      state.syncControls();
+      updateHistoryList();
+    };
     function showResults() {
       const drawn = state.drawn;
       state.syncControls();
-      status.textContent = drawn.length ? `候補${pool.length}曲から${drawn.length}曲を選びました。` :
-        !state.selected.size ? '選曲元にチェックを入れてください。' : pool.length ? `候補は${pool.length}曲です。` : '選曲できる曲がありません。';
+      drawnNote.textContent = `${drawn.length}曲を選びました。`;
       list.replaceChildren(...drawn.map(song => {
         const { row, actions } = songCard(song);
         if (ctx.roomId) actions.prepend(proposalButton(ctx, song));
         return row;
       }));
-      list.hidden = !drawn.length;
+      drawnNote.hidden = list.hidden = !drawn.length;
     }
     function resetDraw() {
       say(ctx, '');
       state.drawn = [];
-      pool = randomCandidates(db, state);
+      state.syncHistory();
       showResults();
     }
-    ctx.content.append(heading, field, controls, status, list);
-    pool = randomCandidates(db, state);
+    panel.append(controls, el('p', 'tt-pl-note', folders.length ? 'このフォルダの曲や、下の一覧でチェックしたフォルダから選びます。' :
+      'チェックした選曲元から、指定した曲数をランダムに選びます。'), choices, settings,
+      el('p', 'tt-pl-note', '指定した曲数だけ別の曲が提案されるまで、同じ曲を候補から外します。0で無効。'),
+      history, status, drawnNote, list);
+    state.syncHistory();
     showResults();
+    return { panel, sourceLabel };
   }
 
   function renderBrowse(ctx, db) {
@@ -1101,15 +1238,21 @@
     ctx.content.append(breadcrumb(db, ctx.folder, open));
     const controls = el('div', 'tt-pl-toolbar');
     if (folder) controls.append(button('上へ', () => open(folder.parent)));
-    controls.append(button('新規フォルダ', act(ctx, () => createFolder(ctx))), folderOperations(ctx, db, folder));
-    ctx.content.append(controls);
+    controls.append(button('新規フォルダ', act(ctx, () => createFolder(ctx))));
+    if (folder) controls.append(button('名前を変更', act(ctx, () => renameFolder(ctx, folder))),
+      button('フォルダを移動', () => {
+        ctx.moveFolder = folder.parent;
+        selectView(ctx, 'move');
+      }), button('フォルダを削除', act(ctx, () => deleteFolder(ctx, folder))));
     const childFolders = children(db, ctx.folder);
+    const random = renderRandom(ctx, db, childFolders);
+    ctx.content.append(controls, random.panel);
     const list = el('div', 'tt-pl-list');
     if (childFolders.length) {
       const sub = el('div');
       sub.setAttribute('role', 'group');
       sub.setAttribute('aria-label', 'この場所のフォルダ');
-      for (const f of childFolders) sub.append(folderRow(f, open));
+      for (const f of childFolders) sub.append(folderRow(f, open, random.sourceLabel(f.id, f.name)));
       list.append(sub);
     }
     const stored = db.songs.filter(s => folder ? s.folders.includes(folder.id) : s.folders.length === 0)
@@ -1166,18 +1309,20 @@
   }
 
   function selectView(ctx, view) {
-    if (view !== 'random') stopRandomBatch(ctx);
+    if (view !== 'browse') stopRandomBatch(ctx);
+    if (view !== 'search') stopSearch(ctx);
     ctx.view = view;
     say(ctx, '');
     redraw(ctx);
+    if (view === 'search') resumeSearch(ctx);
   }
 
   function redraw(ctx) {
     closePicker(ctx);
-    ctx.content.replaceChildren();
     try {
       const db = readDb();
       if (ctx.kind === 'detail') {
+        ctx.content.replaceChildren();
         const saved = db.songs.find(s => s.id === ctx.song.id);
         ctx.tab.textContent = saved ? '拡張プレイリストの登録先' : '拡張プレイリストに保存';
         if (!ctx.panel.hidden) {
@@ -1189,21 +1334,21 @@
         return;
       }
       const folder = db.folders.find(f => f.id === ctx.folder);
-      if (!folder) ctx.folder = ROOT;
-      if ((ctx.view === 'move' && !folder) || (ctx.view === 'random' && ctx.randomChoice.folder !== ctx.folder)) {
+      if (!folder && ctx.folder !== ROOT) {
         stopRandomBatch(ctx);
-        ctx.view = 'browse';
+        ctx.folder = ROOT;
       }
-      const selected = ctx.view === 'import' ? 'more' : ['move', 'random'].includes(ctx.view) ? 'browse' : ctx.view;
+      if (ctx.view === 'move' && !folder) ctx.view = 'browse';
+      const selected = ctx.view === 'import' ? 'more' : ctx.view === 'move' ? 'browse' : ctx.view;
       for (const [view, tab] of ctx.innerTabs) {
         tab.setAttribute('aria-selected', String(view === selected));
         tab.tabIndex = view === selected ? 0 : -1;
       }
       ctx.content.setAttribute('aria-labelledby', ctx.innerTabs.get(selected).id);
-      if (ctx.view === 'search') renderSearch(ctx, db);
-      else if (selected === 'more') renderMore(ctx, db);
+      if (ctx.view === 'search') { renderSearch(ctx, db); return; }
+      ctx.content.replaceChildren();
+      if (selected === 'more') renderMore(ctx, db);
       else if (ctx.view === 'move') renderMove(ctx, db, folder);
-      else if (ctx.view === 'random') renderRandom(ctx, db);
       else renderBrowse(ctx, db);
     } catch (error) {
       report(ctx, error);
@@ -1260,6 +1405,7 @@
     if (!show) {
       closePicker(ctx);
       stopRandomBatch(ctx);
+      stopSearch(ctx);
     }
     if (ctx.kind === 'room') ctx.host.toggleAttribute('data-tt-pl-room-open', show);
     ctx.panel.hidden = !show;
@@ -1268,6 +1414,7 @@
       ctx.rendered = true;
       redraw(ctx);
     }
+    if (show && ctx.view === 'search') resumeSearch(ctx);
   }
 
   function hasAction(node, name) {
@@ -1313,6 +1460,7 @@
       if (host.hidden || host.classList.contains('is-hidden')) {
         closePicker(ctx);
         stopRandomBatch(ctx);
+        stopSearch(ctx);
       }
       showPanel(ctx, tab.classList.contains('active'));
     });
@@ -1417,7 +1565,7 @@
   function remove(ctx) {
     closePicker(ctx);
     stopRandomBatch(ctx);
-    ctx.remote?.request?.abort();
+    stopSearch(ctx);
     ctx.disconnect?.();
     ctx.nav?.remove();
     ctx.tab.remove();
@@ -1478,6 +1626,16 @@
     for (const ctx of mounted.values()) remove(ctx);
   });
   GM_addValueChangeListener(KEY, (_key, _old, _new, remote) => { if (remote) redrawAll(); });
+  GM_addValueChangeListener(HISTORY_KEY, (_key, _old, value, remote) => {
+    if (!remote) return;
+    proposalHistory = historyValue(value);
+    refreshHistory();
+  });
+  GM_addValueChangeListener(GAP_KEY, (_key, _old, value, remote) => {
+    if (!remote) return;
+    proposalGap = gapValue(value) ?? GAP_DEFAULT;
+    refreshHistory(true);
+  });
   mount();
 })();
 

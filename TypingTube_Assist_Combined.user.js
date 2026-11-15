@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.1.2
+// @version      8.1.3
 // @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
   if (window.top !== window || document.documentElement.hasAttribute('data-tt-extended-playlist')) return;
-  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.2');
+  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.3');
 
   const KEY = 'tt-extended-playlist-v1';
   const MODAL = '[data-battle-room-target~="songSearchModal"]';
@@ -287,6 +287,7 @@
   }
 
   function openFolder(ctx, id) {
+    stopRandomBatch(ctx);
     ctx.folder = id;
     ctx.query = '';
     ctx.view = 'browse';
@@ -624,18 +625,22 @@
     return exact.length || ctx.roomId ? exact : lookupSongPage(id, signal);
   }
 
-  function syncProposalButtons(ctx, id) {
+  function paintProposalButton(ctx, target, id) {
     const state = ctx.proposals.get(id);
-    for (const target of ctx.panel.querySelectorAll(`[data-tt-pl-propose="${id}"]`)) {
-      target.disabled = !!state;
-      target.classList.toggle('proposed', state === 'done');
-      target.textContent = state === 'pending' ? '提案中…' : state === 'done' ? '提案済み' : '提案';
-    }
+    const waiting = ctx.randomBatch && !ctx.randomBatch.cancelled && ctx.randomBatch.waiting.has(id);
+    target.disabled = !!state || !!ctx.randomBatch;
+    target.classList.toggle('proposed', state === 'done');
+    target.textContent = state === 'pending' ? '提案中…' : state === 'done' ? '提案済み' : waiting ? '提案待ち' : '提案';
   }
 
-  async function proposeSong(ctx, song) {
+  function syncProposalButtons(ctx, id) {
+    const selector = id ? `[data-tt-pl-propose="${id}"]` : '[data-tt-pl-propose]';
+    for (const target of ctx.panel.querySelectorAll(selector)) paintProposalButton(ctx, target, target.getAttribute('data-tt-pl-propose'));
+  }
+
+  async function proposeSong(ctx, song, batch) {
+    if ((ctx.randomBatch && ctx.randomBatch !== batch) || ctx.proposals.has(song.id)) return false;
     const endpoint = requireRoom(ctx);
-    if (ctx.proposals.has(song.id)) return;
     const csrf = document.querySelector('meta[name="csrf-token"]')?.content;
     if (!csrf) throw new Error('提案するには、ログインした状態でページを読み直してください。');
     const body = { movie_id: song.id };
@@ -645,13 +650,14 @@
     if (zone?.value) body.zone_layout = zone.value;
     ctx.proposals.set(song.id, 'pending');
     syncProposalButtons(ctx, song.id);
-    say(ctx, '');
+    if (!batch) say(ctx, '');
     try {
       const response = await fetch(`${endpoint}/propose_song`, {
         method: 'POST', credentials: 'same-origin',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
         body: JSON.stringify(body)
       });
+      if (response.redirected) throw new Error('提案するには、ログインした状態でページを読み直してください。');
       if (!response.ok) {
         const error = await response.json().catch(() => null);
         const message = textValue(error?.error, 500) || textValue(error?.message, 500) ||
@@ -659,7 +665,8 @@
         throw new Error(message || `提案できませんでした（HTTP ${response.status}）。`);
       }
       ctx.proposals.set(song.id, 'done');
-      say(ctx, `「${song.title}」を提案しました。`);
+      if (!batch) say(ctx, `「${song.title}」を提案しました。`);
+      return true;
     } catch (error) {
       ctx.proposals.delete(song.id);
       throw error;
@@ -669,13 +676,10 @@
   }
 
   function proposalButton(ctx, song) {
-    const state = ctx.proposals.get(song.id);
-    const node = button(state === 'pending' ? '提案中…' : state === 'done' ? '提案済み' : '提案',
-      act(ctx, () => proposeSong(ctx, song)), 'room-search-propose-btn');
-    node.disabled = !!state;
-    node.classList.toggle('proposed', state === 'done');
+    const node = button('', act(ctx, () => proposeSong(ctx, song)), 'room-search-propose-btn');
     node.setAttribute('data-tt-pl-propose', song.id);
     node.dataset.movieId = song.id;
+    paintProposalButton(ctx, node, song.id);
     return node;
   }
 
@@ -942,6 +946,57 @@
     return chosen.slice(0, size);
   }
 
+  function batchStatus(ctx, batch, message) {
+    if (ctx.view === 'random' && ctx.randomChoice === batch.choice && ctx.panel.isConnected) say(ctx, message);
+  }
+
+  function stopRandomBatch(ctx, announce = false) {
+    const batch = ctx.randomBatch;
+    if (!batch || batch.cancelled) return;
+    batch.cancelled = true;
+    syncProposalButtons(ctx);
+    ctx.randomChoice?.syncControls?.();
+    if (announce) batchStatus(ctx, batch, '残りの曲の自動提案を停止します。');
+  }
+
+  async function runRandomBatch(ctx, batch) {
+    const total = batch.songs.length;
+    let sent = 0;
+    let skipped = 0;
+    let failure = '';
+    batchStatus(ctx, batch, `${total}曲を選びました。表示順に提案します。`);
+    try {
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      for (const [index, song] of batch.songs.entries()) {
+        if (batch.cancelled || ctx.panel.hidden || !ctx.panel.isConnected || ctx.host.hidden ||
+            ctx.host.classList.contains('is-hidden') || ctx.view !== 'random' || ctx.randomChoice !== batch.choice ||
+            roomIdFor(ctx.host) !== ctx.roomId) {
+          batch.cancelled = true;
+          break;
+        }
+        batch.waiting.delete(song.id);
+        if (ctx.proposals.has(song.id)) { skipped++; continue; }
+        batchStatus(ctx, batch, `${index + 1}/${total}曲目を提案中：${song.title}（送信済み${sent}曲）`);
+        try {
+          if (await proposeSong(ctx, song, batch)) sent++;
+          else skipped++;
+        } catch (error) {
+          failure = `「${song.title}」の提案で停止しました：${error?.message || '送信できませんでした。'}`;
+          break;
+        }
+        if (index + 1 < total && !batch.cancelled) await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    } finally {
+      ctx.randomBatch = null;
+      syncProposalButtons(ctx);
+      ctx.randomChoice?.syncControls?.();
+      const left = total - sent - skipped;
+      const heading = failure || (left ? '残りの自動提案を停止しました。' : '自動提案が完了しました。');
+      const summary = `提案${sent}曲${skipped ? `・すでに提案済み${skipped}曲` : ''}${left ? `・未完了${left}曲` : ''}`;
+      batchStatus(ctx, batch, `${heading}（${summary}）`);
+    }
+  }
+
   function renderRandom(ctx, db) {
     const state = ctx.randomChoice;
     const folders = children(db, ctx.folder);
@@ -954,13 +1009,18 @@
     const field = el('fieldset', 'tt-pl-random-folders');
     const choices = el('div', 'tt-pl-picker-children tt-pl-choices');
     const addChoice = (id, label) => choices.append(checkbox(label, state.selected.has(id), on => {
+      if (ctx.randomBatch) return;
       if (on) state.selected.add(id); else state.selected.delete(id);
       resetDraw();
     }));
     addChoice(ctx.folder, ctx.folder === ROOT ? '一番上の未分類曲' : '現在のフォルダ直下の曲');
     for (const folder of folders) addChoice(folder.id, folder.name);
     field.append(el('legend', '', '選曲元'), choices);
-    const nested = checkbox('チェックした子フォルダの下の階層も含める', state.nested, on => { state.nested = on; resetDraw(); });
+    const nested = checkbox('チェックした子フォルダの下の階層も含める', state.nested, on => {
+      if (ctx.randomBatch) return;
+      state.nested = on;
+      resetDraw();
+    });
     if (folders.length) choices.append(nested);
     const controls = el('div', 'tt-pl-toolbar');
     const label = el('label', 'tt-pl-random-count');
@@ -977,18 +1037,35 @@
     list.setAttribute('role', 'group');
     list.setAttribute('aria-label', 'ランダム選曲の結果');
     let pool = [];
-    const draw = act(ctx, () => {
-      if (!pool.length) return;
+    const draw = act(ctx, async () => {
+      if (ctx.randomBatch || !pool.length) return;
       state.count = number.value;
       const n = Number(state.count);
       if (!Number.isInteger(n) || n < 1) throw new Error('曲数に1以上の整数を入力してください。');
-      state.drawn = sampleSongs(pool, n).map(song => song.id);
+      if (ctx.roomId && [...ctx.proposals.values()].includes('pending')) throw new Error('送信中の提案が完了してからもう一度押してください。');
+      state.drawn = sampleSongs(pool, n);
       say(ctx, '');
+      const batch = ctx.roomId ? { choice: state, songs: state.drawn, waiting: new Set(state.drawn.map(song => song.id)), cancelled: false } : null;
+      if (batch) ctx.randomBatch = batch;
       showResults();
+      if (batch) await runRandomBatch(ctx, batch);
     });
-    const start = button('ランダム選曲', draw);
+    const start = button(ctx.roomId ? 'ランダム選曲して自動提案' : 'ランダム選曲', draw);
+    const stop = button('残りを停止', () => stopRandomBatch(ctx, true));
     controls.append(label, start);
-    number.addEventListener('input', () => { state.count = number.value; resetDraw(); });
+    if (ctx.roomId) controls.append(stop);
+    state.syncControls = () => {
+      const batch = ctx.randomBatch;
+      field.disabled = number.disabled = !!batch;
+      start.disabled = !pool.length || !!batch;
+      stop.hidden = !batch;
+      stop.disabled = !!batch?.cancelled;
+    };
+    number.addEventListener('input', () => {
+      if (ctx.randomBatch) return;
+      state.count = number.value;
+      resetDraw();
+    });
     number.addEventListener('keydown', event => {
       if (event.key === 'Enter' && !event.isComposing) {
         event.preventDefault();
@@ -996,9 +1073,8 @@
       }
     });
     function showResults() {
-      const found = new Map(pool.map(song => [song.id, song]));
-      const drawn = state.drawn.map(id => found.get(id)).filter(Boolean);
-      start.disabled = !pool.length;
+      const drawn = state.drawn;
+      state.syncControls();
       status.textContent = drawn.length ? `候補${pool.length}曲から${drawn.length}曲を選びました。` :
         !state.selected.size ? '選曲元にチェックを入れてください。' : pool.length ? `候補は${pool.length}曲です。` : '選曲できる曲がありません。';
       list.replaceChildren(...drawn.map(song => {
@@ -1090,6 +1166,7 @@
   }
 
   function selectView(ctx, view) {
+    if (view !== 'random') stopRandomBatch(ctx);
     ctx.view = view;
     say(ctx, '');
     redraw(ctx);
@@ -1113,7 +1190,10 @@
       }
       const folder = db.folders.find(f => f.id === ctx.folder);
       if (!folder) ctx.folder = ROOT;
-      if ((ctx.view === 'move' && !folder) || (ctx.view === 'random' && ctx.randomChoice.folder !== ctx.folder)) ctx.view = 'browse';
+      if ((ctx.view === 'move' && !folder) || (ctx.view === 'random' && ctx.randomChoice.folder !== ctx.folder)) {
+        stopRandomBatch(ctx);
+        ctx.view = 'browse';
+      }
       const selected = ctx.view === 'import' ? 'more' : ['move', 'random'].includes(ctx.view) ? 'browse' : ctx.view;
       for (const [view, tab] of ctx.innerTabs) {
         tab.setAttribute('aria-selected', String(view === selected));
@@ -1177,7 +1257,10 @@
   }
 
   function showPanel(ctx, show) {
-    if (!show) closePicker(ctx);
+    if (!show) {
+      closePicker(ctx);
+      stopRandomBatch(ctx);
+    }
     if (ctx.kind === 'room') ctx.host.toggleAttribute('data-tt-pl-room-open', show);
     ctx.panel.hidden = !show;
     ctx.tab.setAttribute('aria-pressed', String(show));
@@ -1227,7 +1310,10 @@
     ctx.panel.setAttribute('data-tt-pl-room-panel', '');
     tabs.after(ctx.panel);
     const listener = new MutationObserver(() => {
-      if (host.hidden || host.classList.contains('is-hidden')) closePicker(ctx);
+      if (host.hidden || host.classList.contains('is-hidden')) {
+        closePicker(ctx);
+        stopRandomBatch(ctx);
+      }
       showPanel(ctx, tab.classList.contains('active'));
     });
     listener.observe(tab, { attributes: true, attributeFilter: ['class'] });
@@ -1330,6 +1416,7 @@
 
   function remove(ctx) {
     closePicker(ctx);
+    stopRandomBatch(ctx);
     ctx.remote?.request?.abort();
     ctx.disconnect?.();
     ctx.nav?.remove();

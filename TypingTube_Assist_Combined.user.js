@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.0.7
-// @description  チャット識別・フォロー・ブロック・コメントリアクション表示切替・オンライン表示・コメントメニュー・入力欄横のフォロー/ブロック一覧・ライブリアクション・ランキング版選択・公開日時付き履歴・曲ID検索・拡張プレイリスト
+// @version      8.0.8
+// @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
 // @grant        GM_xmlhttpRequest
@@ -721,6 +721,7 @@ let listsPopup=null;
 let composerScanPending=false;
 let menuEventsStarted=false;
 const composerMenus=new Map();
+const CHAT_MENU_FIELDS='input[placeholder], textarea[placeholder]';
 let composerResizeObserver=null;
 
 function applyChatReactionVisibility() {
@@ -924,33 +925,16 @@ function createUserListsToolbar() {
 }
 
 function editableTextboxRect(input) {
-  if (!input.matches('.room-chat-input, .lobby-chat-input')) return null;
     if(
-      !input.matches('textarea, input:not([type]), input[type="text"]')||
+      !input.matches(CHAT_MENU_FIELDS)||
+      (input.tagName==='INPUT'&&input.type!=='text')||
+      (input.getAttribute('placeholder')||'').normalize('NFKC').trim()!=='メッセージを入力...'||
       input.disabled||
       input.readOnly||
       input.matches(':disabled')||
-      input.closest('.tt-user-popup, #tt-cloud-id-search-v006, [hidden], [inert], [aria-hidden="true"]')
+      input.closest('[role="search"], [role="searchbox"], [hidden], [inert], [aria-hidden="true"]')
     )return null;
-  
-    const identity=[
-      input.id,
-      input.name,
-      input.className,
-      input.placeholder,
-      input.getAttribute('aria-label'),
-      input.getAttribute('role'),
-      ...Array.from(input.attributes)
-        .filter(attr=>/^data-[\w-]+-target$/.test(attr.name))
-        .map(attr=>attr.value)
-    ].join(' ').replace(/tt-textbox-menu-field/g,'');
-  
-    if(
-      /search|query|keyword|filter|検索|絞り込/i.test(identity)||
-      input.closest('[role="search"]')||
-      /search|検索/i.test(input.form?.getAttribute('action')||'')
-    )return null;
-  
+
     if(!input.isConnected||!input.getClientRects().length)return null;
   
     const style=window.getComputedStyle(input);
@@ -1034,6 +1018,13 @@ function decorateChatComposers() {
     }
   }
 
+  for(const input of document.querySelectorAll('.tt-textbox-menu-field, [data-tt-textbox-menu]')){
+    if(composerMenus.has(input))continue;
+    input.classList.remove('tt-textbox-menu-field');
+    input.removeAttribute('data-tt-textbox-menu');
+    input.style.removeProperty('--tt-textbox-original-padding');
+  }
+
   const retained=new Set(Array.from(composerMenus.values(),entry=>entry.button));
 
   for(const button of document.querySelectorAll('.tt-composer-meatball')){
@@ -1047,7 +1038,8 @@ function decorateChatComposers() {
     if(editableTextboxRect(input)&&entry.button.isConnected)continue;
     if(activeUserMenu?.trigger===entry.button)closeUserMenu();
     entry.button.remove();
-    input.classList.toggle('tt-textbox-menu-field',false);
+    input.classList.remove('tt-textbox-menu-field');
+    input.removeAttribute('data-tt-textbox-menu');
 
     if(entry.paddingValue){
       input.style.setProperty('--tt-textbox-original-padding',entry.paddingValue,entry.paddingPriority);
@@ -1063,7 +1055,7 @@ function decorateChatComposers() {
     composerResizeObserver=new ResizeObserver(scheduleComposerMenus);
   }
 
-  for(const input of document.querySelectorAll('.room-chat-input, .lobby-chat-input')){
+  for(const input of document.querySelectorAll(CHAT_MENU_FIELDS)){
     if(composerMenus.has(input)||!editableTextboxRect(input))continue;
 
     const paddingValue=input.style.getPropertyValue('--tt-textbox-original-padding');
@@ -1072,6 +1064,7 @@ function decorateChatComposers() {
 
     input.style.setProperty('--tt-textbox-original-padding',padding);
     input.classList.add('tt-textbox-menu-field');
+    input.setAttribute('data-tt-textbox-menu','');
 
     const button=makeMenuButton('…','tt-composer-meatball','フォロー・ブロック一覧');
     button.hidden=true;
@@ -1991,7 +1984,7 @@ GM_addStyle(`
 .tt-comment-kebab:focus-visible, .tt-composer-meatball:focus-visible, .tt-menu-item:focus-visible {
   outline: 2px solid #1976d2 !important; outline-offset: 2px;
 }
-.tt-textbox-menu-field {
+.tt-textbox-menu-field[data-tt-textbox-menu] {
   box-sizing: border-box !important;
   padding-right: calc(var(--tt-textbox-original-padding, 0px) + 38px) !important;
 }
@@ -2857,28 +2850,41 @@ void(async()=>{
   const KEY = 'tt-extended-playlist-v1';
   const MODAL = '[data-battle-room-target~="songSearchModal"]';
   const TARGET = name => `[data-battle-room-target~="${name}"]`;
-  const NATIVE_SEARCH = '[data-action~="click->battle-room#switchToSearch"]';
-  const NATIVE_LATER = '[data-action~="click->battle-room#switchToPlayLater"]';
+  const ROOM_TABS = '.room-search-tabs';
+  const LATER_PANEL = '[data-play-later-target~="panel"]';
+  const LATER_LIST = '[data-play-later-target~="list"]';
+  const DETAIL_ADD = '[data-play-later-movie-id-param]';
+  const DETAIL_CTA = '[data-movie-detail-target~="ctaSection"]';
   const ROOT = '';
   const UNFILED = '~';
   const mounted = new Map();
   let mounting = false;
+  let suspended = false;
   let writes = Promise.resolve();
 
   GM_addStyle(`
     .tt-pl-modal:has(.tt-pl-tab.active) :is([data-battle-room-target~="songSearchPane"], [data-battle-room-target~="songSearchStatus"], [data-battle-room-target~="songSearchResults"]) { display: none !important; }
     .tt-pl-modal:not(:has(.tt-pl-tab.active)) .tt-pl-panel { display: none !important; }
     .tt-pl-modal .room-search-tabs { flex-wrap: wrap; }
+    .tt-pl-standard[data-tt-pl-show-saved] :is([data-play-later-target~="list"], [data-play-later-target~="emptyMsg"], [data-play-later-target~="sortBtn"], [data-play-later-target~="count"], [data-action~="click->play-later#clearAll"], [data-action~="play-later#clearAll"]) { display: none !important; }
+    .tt-pl-nav { display: flex; flex-wrap: wrap; gap: .4rem; padding: .45rem .65rem; }
+    .tt-pl-tab[aria-pressed="true"], .tt-pl-nav .tt-pl-btn[aria-pressed="true"] { font-weight: 700; }
     .tt-pl-panel { display: grid; gap: .65rem; }
+    .tt-pl-panel[hidden] { display: none !important; }
+    .tt-pl-standard .tt-pl-panel, .tt-pl-detail .tt-pl-panel { padding: .6rem; }
+    .tt-pl-detail { margin: .45rem 0; }
     .tt-pl-panel-content { display: grid; gap: .55rem; }
     .tt-pl-panel .tt-pl-toolbar { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
     .tt-pl-panel .tt-pl-toolbar input[type="search"] { flex: 1 1 10rem; min-width: 0; }
     .tt-pl-panel .tt-pl-list { max-height: min(48vh, 26rem); overflow: auto; display: grid; gap: .3rem; }
-    .tt-pl-panel .tt-pl-list .room-search-result-row { flex-wrap: wrap; }
+    .tt-pl-panel .tt-pl-list .room-search-result-row { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; padding: .4rem; }
     .tt-pl-panel .tt-pl-list .room-search-result-info { flex: 1 1 8rem; min-width: 0; }
+    .tt-pl-panel .room-search-result-thumb img { display: block; width: 68px; aspect-ratio: 16 / 9; object-fit: cover; }
+    .tt-pl-panel .room-search-result-title { overflow-wrap: anywhere; }
+    .tt-pl-panel .room-search-result-meta { display: flex; flex-wrap: wrap; gap: .45em; }
     .tt-pl-panel .tt-pl-choices label { display: flex; align-items: baseline; gap: .5rem; padding: .25rem; overflow-wrap: anywhere; }
     .tt-pl-panel .tt-pl-choices input { flex: none; }
-    .tt-pl-panel .tt-pl-btn { cursor: pointer; background: transparent; color: inherit; border: 1px solid currentColor; border-radius: .35rem; padding: .3rem .55rem; font: inherit; text-decoration: none; }
+    :is(.tt-pl-panel, .tt-pl-nav, .tt-pl-detail) .tt-pl-btn { cursor: pointer; background: transparent; color: inherit; border: 1px solid currentColor; border-radius: .35rem; padding: .3rem .55rem; font: inherit; text-decoration: none; }
     .tt-pl-panel .tt-pl-btn:disabled { opacity: .55; cursor: default; }
     .tt-pl-panel .tt-pl-note { margin: 0; font-size: .85em; overflow-wrap: anywhere; }
     .tt-pl-panel .tt-pl-status:empty { display: none; }
@@ -2912,18 +2918,61 @@ void(async()=>{
     return /^[1-9]\d{0,14}$/.test(id) ? id : '';
   }
 
+  function thumbUrl(value) {
+    if (typeof value !== 'string' || value.length > 500) return '';
+    try {
+      const url = new URL(value);
+      if (url.protocol === 'https:' && !url.username && !url.password &&
+          ['i.ytimg.com', 'img.youtube.com', 'd2kibbevux4y1g.cloudfront.net'].includes(url.hostname)) return url.href;
+    } catch {}
+    return '';
+  }
+
+  function positiveNumber(value, limit = Number.MAX_SAFE_INTEGER) {
+    if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '') return null;
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 && n <= limit ? n : null;
+  }
+
   function movie(raw) {
     const id = movieId(raw?.id);
     if (!id) return null;
     const vid = textValue(raw.video_id, 30);
-    const level = raw.level == null || raw.level === '' ? NaN : Number(raw.level);
     return {
       id,
       title: textValue(raw.title, 500) || `譜面 ${id}`,
-      channel_name: textValue(raw.channel_name, 200),
+      channel_name: textValue(raw.creator_name, 200) || textValue(raw.channel_name, 200),
       video_id: /^[A-Za-z0-9_-]{11}$/.test(vid) ? vid : '',
-      level: Number.isFinite(level) && level >= 0 && level <= 100 ? level : null
+      thumbnail_url: thumbUrl(raw.thumbnail_url),
+      level: positiveNumber(raw.level, 100),
+      sec: positiveNumber(raw.sec),
+      play_count: positiveNumber(raw.play_count),
+      line_count: positiveNumber(raw.line_count),
+      total_type_roma: positiveNumber(raw.total_type_roma),
+      type_per_min: positiveNumber(raw.type_per_min)
     };
+  }
+
+  function moviesFrom(payload) {
+    const source = Array.isArray(payload) ? payload : payload?.movies;
+    if (!Array.isArray(source)) throw new Error('曲一覧の形式を読み取れませんでした。');
+    return [...new Map(source.map(movie).filter(Boolean).map(song => [song.id, song])).values()];
+  }
+
+  function storeSong(db, song, dest = ROOT) {
+    needFolder(db, dest);
+    let target = db.songs.find(s => s.id === song.id);
+    if (!target) {
+      target = { ...song, folders: [], savedAt: Date.now() };
+      db.songs.push(target);
+    } else {
+      for (const [key, value] of Object.entries(movie(song))) {
+        if (value == null || value === '' || (key === 'title' && value === `譜面 ${song.id}`)) continue;
+        target[key] = value;
+      }
+    }
+    if (dest && !target.folders.includes(dest)) target.folders.push(dest);
+    return target;
   }
 
   function validate(raw) {
@@ -3013,6 +3062,7 @@ void(async()=>{
   }
 
   function openFolder(ctx, id) {
+    ctx.remote?.request?.abort();
     ctx.folder = id;
     ctx.query = '';
     ctx.view = 'browse';
@@ -3108,16 +3158,17 @@ void(async()=>{
     for (const f of db.folders.slice().sort((a, b) => pathOf(db, a.id).localeCompare(pathOf(db, b.id), 'ja'))) {
       choices.append(checkbox(pathOf(db, f.id), chosen.has(f.id), on => on ? chosen.add(f.id) : chosen.delete(f.id)));
     }
-    if (!db.folders.length) choices.append(el('p', 'tt-pl-note', '先に一覧からフォルダを作ってください。'));
+    if (!db.folders.length) choices.append(el('p', 'tt-pl-note', 'フォルダは「拡張プレイリスト」の一覧で作成できます。'));
     ctx.content.append(choices, el('p', 'tt-pl-note', 'すべてのチェックを外すと「未分類」になります。'));
-    ctx.content.append(button('登録先を保存', act(ctx, async () => {
+    const detail = ctx.kind === 'detail';
+    ctx.content.append(button(detail ? 'この譜面を保存' : '登録先を保存', act(ctx, async () => {
       await change(current => {
-        const target = current.songs.find(s => s.id === song.id);
+        const target = detail ? storeSong(current, song) : current.songs.find(s => s.id === song.id);
         if (!target) throw new Error('この譜面は削除されています。');
         target.folders = [...chosen].filter(id => current.folders.some(f => f.id === id));
       });
-      openFolder(ctx, ctx.folder);
-      say(ctx, '登録先を保存しました。');
+      if (!detail) openFolder(ctx, ctx.folder);
+      say(ctx, detail ? '拡張プレイリストに保存しました。' : '登録先を保存しました。');
     })));
   }
 
@@ -3131,13 +3182,12 @@ void(async()=>{
       const response = await fetch('/api/play_later', { headers: { Accept: 'application/json' } });
       if (!response.ok) throw new Error(`標準リストを読み込めませんでした（HTTP ${response.status}）。`);
       const data = await response.json();
-      if (!Array.isArray(data.movies)) throw new Error('標準リストの形式を確認できませんでした。');
-      pending.movies = [...new Map(data.movies.map(movie).filter(Boolean).map(song => [song.id, song])).values()];
+      pending.movies = moviesFrom(data);
     } catch (error) {
       pending.error = error.message || '標準リストを読み込めませんでした。';
     }
     pending.loading = false;
-    if (ctx.view !== 'import' || ctx.importState !== pending || !ctx.modal.isConnected) return;
+    if (ctx.view !== 'import' || ctx.importState !== pending || !ctx.panel.isConnected) return;
     redraw(ctx);
     say(ctx, pending.error);
   }
@@ -3158,16 +3208,7 @@ void(async()=>{
       const selected = state.movies.filter(s => state.selected.has(s.id));
       if (!selected.length) return;
       await change(current => {
-        needFolder(current, dest);
-        const known = new Map(current.songs.map(s => [s.id, s]));
-        for (const song of selected) {
-          const old = known.get(song.id);
-          if (old) {
-            if (dest && !old.folders.includes(dest)) old.folders.push(dest);
-          } else {
-            current.songs.push({ ...song, folders: dest ? [dest] : [], savedAt: Date.now() });
-          }
-        }
+        for (const song of selected) storeSong(current, song, dest);
       });
       openFolder(ctx, ctx.folder);
       say(ctx, `${selected.length}件を保存しました。`);
@@ -3211,15 +3252,7 @@ void(async()=>{
     const title = before?.title ?? window.prompt('譜面名（空欄ならIDで表示）', '');
     if (title === null) return;
     const dest = ctx.folder === UNFILED ? ROOT : ctx.folder;
-    await change(db => {
-      needFolder(db, dest);
-      let target = db.songs.find(s => s.id === id);
-      if (!target) {
-        target = { ...movie({ id, title }), folders: [], savedAt: Date.now() };
-        db.songs.push(target);
-      }
-      if (dest && !target.folders.includes(dest)) target.folders.push(dest);
-    });
+    await change(db => { storeSong(db, movie({ id, title }), dest); });
     say(ctx, '譜面を保存しました。');
   }
 
@@ -3249,14 +3282,100 @@ void(async()=>{
     return value.normalize('NFKC').toLocaleLowerCase('ja-JP');
   }
 
-  function songRow(ctx, song, db) {
+  function roomIdFor(node) {
+    const route = movieId(location.pathname.match(/^\/battle\/(\d+)\/?$/)?.[1]);
+    const controller = node.closest('[data-controller~="battle-room"]');
+    return route || movieId(controller?.getAttribute('data-battle-room-room-id-value'));
+  }
+
+  function requireRoom(ctx) {
+    if (!ctx.roomId || !ctx.panel.isConnected || roomIdFor(ctx.host) !== ctx.roomId) {
+      throw new Error('対戦ルームを開き直してからお試しください。');
+    }
+    return `/api/battle_rooms/${ctx.roomId}`;
+  }
+
+  async function searchRoom(ctx, query, signal) {
+    const endpoint = requireRoom(ctx);
+    const response = await fetch(`${endpoint}/search_songs?q=${encodeURIComponent(query)}`, {
+      credentials: 'same-origin', headers: { Accept: 'application/json' }, signal
+    });
+    if (!response.ok) throw new Error(`曲を検索できませんでした（HTTP ${response.status}）。`);
+    const found = moviesFrom(await response.json());
+    const id = movieId(query);
+    return id ? found.filter(song => song.id === id) : found;
+  }
+
+  function syncProposalButtons(ctx, id) {
+    const state = ctx.proposals.get(id);
+    for (const target of ctx.panel.querySelectorAll(`[data-tt-pl-propose="${id}"]`)) {
+      target.disabled = !!state;
+      target.classList.toggle('proposed', state === 'done');
+      target.textContent = state === 'pending' ? '提案中…' : state === 'done' ? '提案済み' : '提案';
+    }
+  }
+
+  async function proposeSong(ctx, song) {
+    const endpoint = requireRoom(ctx);
+    if (ctx.proposals.has(song.id)) return;
+    const csrf = document.querySelector('meta[name="csrf-token"]')?.content;
+    if (!csrf) throw new Error('提案するには、ログインした状態でページを読み直してください。');
+    const body = { movie_id: song.id };
+    const modal = ctx.host.closest(MODAL);
+    const room = ctx.host.closest('[data-controller~="battle-room"]');
+    const zone = (modal || ctx.host).querySelector(TARGET('proposalZoneLayout')) || room?.querySelector(TARGET('proposalZoneLayout'));
+    if (zone?.value) body.zone_layout = zone.value;
+    ctx.proposals.set(song.id, 'pending');
+    syncProposalButtons(ctx, song.id);
+    say(ctx, '');
+    try {
+      const response = await fetch(`${endpoint}/propose_song`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => null);
+        const message = textValue(error?.error, 500) || textValue(error?.message, 500) ||
+          (Array.isArray(error?.errors) ? error.errors.filter(e => typeof e === 'string').join('・').slice(0, 500) : '');
+        throw new Error(message || `提案できませんでした（HTTP ${response.status}）。`);
+      }
+      ctx.proposals.set(song.id, 'done');
+      say(ctx, `「${song.title}」を提案しました。`);
+    } catch (error) {
+      ctx.proposals.delete(song.id);
+      throw error;
+    } finally {
+      syncProposalButtons(ctx, song.id);
+    }
+  }
+
+  function proposalButton(ctx, song) {
+    const state = ctx.proposals.get(song.id);
+    const node = button(state === 'pending' ? '提案中…' : state === 'done' ? '提案済み' : '提案',
+      act(ctx, () => proposeSong(ctx, song)), 'room-search-propose-btn');
+    node.disabled = !!state;
+    node.classList.toggle('proposed', state === 'done');
+    node.setAttribute('data-tt-pl-propose', song.id);
+    node.dataset.movieId = song.id;
+    return node;
+  }
+
+  function songCard(song) {
     const row = el('div', 'room-search-result-row');
-    if (song.video_id) {
+    const fallbackThumb = song.video_id ? `https://i.ytimg.com/vi/${song.video_id}/mqdefault.jpg` : '';
+    if (song.thumbnail_url || fallbackThumb) {
       const thumb = el('div', 'room-search-result-thumb');
       const img = el('img');
-      img.src = `https://i.ytimg.com/vi/${song.video_id}/mqdefault.jpg`;
       img.alt = '';
       img.loading = 'lazy';
+      img.decoding = 'async';
+      img.referrerPolicy = 'no-referrer';
+      img.addEventListener('error', () => {
+        if (fallbackThumb && img.src !== fallbackThumb) img.src = fallbackThumb;
+        else thumb.remove();
+      });
+      img.src = song.thumbnail_url || fallbackThumb;
       thumb.append(img);
       row.append(thumb);
     }
@@ -3265,19 +3384,48 @@ void(async()=>{
     const meta = el('div', 'room-search-result-meta');
     if (song.channel_name) meta.append(el('span', '', song.channel_name));
     if (song.level !== null) meta.append(el('span', '', `Lv.${song.level}`));
+    if (song.sec !== null) {
+      const seconds = Math.floor(song.sec);
+      meta.append(el('span', '', `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`));
+    }
+    if (song.line_count !== null) meta.append(el('span', '', `${song.line_count}行`));
+    if (song.total_type_roma !== null) meta.append(el('span', '', `${song.total_type_roma}打鍵`));
+    if (song.type_per_min !== null) meta.append(el('span', '', `${Math.round(song.type_per_min)}打/分`));
+    if (song.play_count !== null) meta.append(el('span', '', `${song.play_count.toLocaleString('ja-JP')}回プレイ`));
     meta.append(el('span', '', `#${song.id}`));
     info.append(meta);
-    const folders = song.folders.map(id => pathOf(db, id));
-    info.append(el('div', 'tt-pl-note', folders.length ? folders.join('・') : '未分類'));
-    const propose = button('提案', null, 'room-search-propose-btn');
-    propose.setAttribute('data-action', 'click->battle-room#proposeSongFromSearch');
-    propose.dataset.movieId = song.id;
+    const actions = el('div', 'tt-pl-toolbar');
     const link = el('a', 'tt-pl-btn', '譜面を開く');
     link.href = `/movie/show/${song.id}`;
     link.target = '_blank';
     link.rel = 'noopener';
-    const actions = el('div', 'tt-pl-toolbar');
-    actions.append(propose, link, button('登録先', () => {
+    actions.append(link);
+    row.append(info, actions);
+    return { row, info, actions };
+  }
+
+  function songRow(ctx, song, db) {
+    const { row, info, actions } = songCard(song);
+    const folders = song.folders.map(id => pathOf(db, id));
+    info.append(el('div', 'tt-pl-note', folders.length ? folders.join('・') : '未分類'));
+    if (ctx.roomId) {
+      actions.prepend(proposalButton(ctx, song));
+      actions.append(button('曲情報を更新', act(ctx, async event => {
+        const control = event.currentTarget;
+        control.disabled = true;
+        try {
+          const [found] = await searchRoom(ctx, song.id);
+          if (!found) throw new Error('この譜面IDの検索結果がありませんでした。');
+          await change(current => {
+            if (current.songs.some(s => s.id === song.id)) storeSong(current, found);
+          });
+          say(ctx, '曲情報を更新しました。');
+        } finally {
+          control.disabled = false;
+        }
+      })));
+    }
+    actions.append(button('登録先', () => {
       ctx.view = 'membership';
       ctx.songId = song.id;
       ctx.membership = new Set(song.folders);
@@ -3287,8 +3435,72 @@ void(async()=>{
       await change(current => { current.songs = current.songs.filter(s => s.id !== song.id); });
       say(ctx, '拡張プレイリストから削除しました。');
     })));
-    row.append(info, actions);
     return row;
+  }
+
+  async function runRoomSearch(ctx, query) {
+    if (!query) {
+      say(ctx, '曲名・URL・譜面IDのいずれかを入力してください。');
+      return;
+    }
+    ctx.remote?.request?.abort();
+    const state = { query, movies: [], request: new AbortController(), loading: true };
+    ctx.view = 'remote';
+    ctx.remote = state;
+    redraw(ctx);
+    say(ctx, '曲を検索中…');
+    try {
+      state.movies = await searchRoom(ctx, query, state.request.signal);
+    } catch (error) {
+      if (error.name === 'AbortError') return;
+      state.error = error.message || '曲を検索できませんでした。';
+    } finally {
+      state.loading = false;
+    }
+    if (ctx.remote !== state || ctx.view !== 'remote' || !ctx.panel.isConnected) return;
+    redraw(ctx);
+    say(ctx, state.error || `${state.movies.length}件見つかりました。`);
+  }
+
+  function roomSearchBar(ctx, query = '') {
+    const bar = el('div', 'tt-pl-toolbar');
+    bar.setAttribute('role', 'search');
+    const input = el('input', 'form-input');
+    input.type = 'search';
+    input.placeholder = '曲名・URL・譜面IDで検索';
+    input.setAttribute('aria-label', '対戦ルームの曲検索');
+    input.value = query;
+    const submit = () => runRoomSearch(ctx, input.value.trim());
+    input.addEventListener('keydown', act(ctx, event => {
+      if (event.isComposing || event.key !== 'Enter') return;
+      event.preventDefault();
+      return submit();
+    }));
+    bar.append(input, button('曲を検索', act(ctx, submit)));
+    return bar;
+  }
+
+  function renderRoomSearch(ctx, db) {
+    const { query, movies, error, loading } = ctx.remote;
+    ctx.content.append(roomSearchBar(ctx, query));
+    if (loading || error) return;
+    const dest = ctx.folder === UNFILED ? ROOT : ctx.folder;
+    const target = dest ? pathOf(db, dest) : '未分類（新規の曲）';
+    ctx.content.append(el('p', 'tt-pl-note', `保存先：${target}`));
+    const list = el('div', 'tt-pl-list');
+    for (const song of movies) {
+      const { row, actions } = songCard(song);
+      const saved = db.songs.find(s => s.id === song.id);
+      const registered = saved && (!dest || saved.folders.includes(dest));
+      actions.prepend(proposalButton(ctx, song));
+      actions.append(button(registered ? '保存済み・曲情報を更新' : '保存', act(ctx, async () => {
+        await change(current => { storeSong(current, song, dest); });
+        say(ctx, `「${song.title}」を保存しました。`);
+      })));
+      list.append(row);
+    }
+    if (!movies.length) list.append(el('p', 'tt-pl-note', '条件に一致する譜面が見つかりませんでした。'));
+    ctx.content.append(list);
   }
 
   function renderBrowse(ctx, db) {
@@ -3321,10 +3533,11 @@ void(async()=>{
       for (const f of childFolders) sub.append(button(`📁 ${f.name}`, () => openFolder(ctx, f.id)));
       ctx.content.append(sub);
     }
+    if (ctx.roomId) ctx.content.append(roomSearchBar(ctx));
     const tools = el('div', 'tt-pl-toolbar');
     const search = el('input', 'form-input');
     search.type = 'search';
-    search.placeholder = 'この一覧を曲名・IDで絞り込む';
+    search.placeholder = '保存一覧を曲名・IDで絞り込む';
     search.setAttribute('aria-label', search.placeholder);
     search.value = ctx.query;
     search.addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
@@ -3363,6 +3576,15 @@ void(async()=>{
     ctx.content.replaceChildren();
     try {
       const db = readDb();
+      if (ctx.kind === 'detail') {
+        const saved = db.songs.find(s => s.id === ctx.song.id);
+        ctx.tab.textContent = saved ? '拡張プレイリストの登録先' : '拡張プレイリストに保存';
+        if (!ctx.panel.hidden) {
+          renderMembership(ctx, db, saved || ctx.song);
+          ctx.content.append(button('閉じる', () => toggleDetail(ctx, false)));
+        }
+        return;
+      }
       const folder = db.folders.find(f => f.id === ctx.folder);
       if (ctx.folder !== ROOT && ctx.folder !== UNFILED && !folder) ctx.folder = ROOT;
       if (ctx.view === 'membership' && !db.songs.some(s => s.id === ctx.songId)) ctx.view = 'browse';
@@ -3371,7 +3593,8 @@ void(async()=>{
         openFolder(ctx, ctx.folder);
         say(ctx, '');
       }));
-      if (ctx.view === 'import') renderImport(ctx, db);
+      if (ctx.view === 'remote') renderRoomSearch(ctx, db);
+      else if (ctx.view === 'import') renderImport(ctx, db);
       else if (ctx.view === 'membership') renderMembership(ctx, db, db.songs.find(s => s.id === ctx.songId));
       else if (ctx.view === 'move') renderMove(ctx, db, folder);
       else renderBrowse(ctx, db);
@@ -3381,75 +3604,214 @@ void(async()=>{
   }
 
   function redrawAll() {
-    for (const ctx of mounted.values()) if (ctx.modal.isConnected) redraw(ctx);
+    for (const ctx of mounted.values()) {
+      if (ctx.panel.isConnected && (ctx.rendered || ctx.kind === 'detail')) redraw(ctx);
+    }
+  }
+
+  function panelContext(kind, key, host) {
+    const panel = el('section', 'tt-pl-panel');
+    panel.setAttribute('aria-label', '拡張プレイリスト');
+    panel.hidden = true;
+    const status = el('p', 'tt-pl-note tt-pl-status');
+    status.setAttribute('role', 'status');
+    const content = el('div', 'tt-pl-panel-content');
+    panel.append(status, content);
+    const ctx = { kind, key, host, panel, status, content, folder: ROOT, view: 'browse', query: '' };
+    mounted.set(key, ctx);
+    return ctx;
+  }
+
+  function showPanel(ctx, show) {
+    ctx.panel.hidden = !show;
+    ctx.tab.setAttribute('aria-pressed', String(show));
+    if (show && !ctx.rendered) {
+      ctx.rendered = true;
+      redraw(ctx);
+    }
+  }
+
+  function hasAction(node, name) {
+    return (node.getAttribute('data-action') || '').split(/\s+/).some(token => {
+      const action = token.split('->').pop();
+      return action === name || action.startsWith(name + ':');
+    });
+  }
+
+  function mountRoom(tabs) {
+    if (mounted.has(tabs)) return;
+    const nativeTabs = [...tabs.querySelectorAll('.room-search-tab')];
+    const search = nativeTabs.find(b => hasAction(b, 'battle-room#switchToSearch'));
+    const later = nativeTabs.find(b => hasAction(b, 'battle-room#switchToPlayLater'));
+    if (!search || !later) return;
+    const host = [tabs.closest('.tv-modal-body'), tabs.closest('.tv-modal-content'), tabs.closest(MODAL), tabs.parentElement]
+      .find(node => node?.querySelector(TARGET('songSearchResults')) && node.querySelector(TARGET('songSearchPane')));
+    if (!host) return;
+    const results = host.querySelector(TARGET('songSearchResults'));
+    const ctx = panelContext('room', tabs, host);
+    ctx.anchor = results;
+    ctx.roomId = roomIdFor(host);
+    ctx.proposals = new Map();
+    ctx.previous = search;
+    const tab = button('拡張プレイリスト', () => {
+      ctx.previous = nativeTabs.find(b => b.classList.contains('active')) || ctx.previous;
+      for (const b of nativeTabs) b.classList.remove('active');
+      tab.classList.add('active');
+      showPanel(ctx, true);
+    }, 'room-search-tab tt-pl-tab');
+    tab.setAttribute('aria-pressed', 'false');
+    ctx.tab = tab;
+    host.classList.add('tt-pl-modal');
+    tabs.append(tab);
+    results.after(ctx.panel);
+    const listener = new MutationObserver(() => showPanel(ctx, tab.classList.contains('active')));
+    listener.observe(tab, { attributes: true, attributeFilter: ['class'] });
+    const leave = () => {
+      tab.classList.remove('active');
+      showPanel(ctx, false);
+    };
+    search.addEventListener('click', leave);
+    later.addEventListener('click', leave);
+    ctx.disconnect = () => {
+      listener.disconnect();
+      search.removeEventListener('click', leave);
+      later.removeEventListener('click', leave);
+      if (tab.classList.contains('active') && ctx.previous?.isConnected) ctx.previous.classList.add('active');
+      host.classList.remove('tt-pl-modal');
+    };
+  }
+
+  function mountStandard(host) {
+    if (mounted.has(host)) return;
+    const list = host.querySelector(LATER_LIST);
+    if (!list) return;
+    const ctx = panelContext('standard', host, host);
+    ctx.anchor = list;
+    host.classList.add('tt-pl-standard');
+    const nav = el('div', 'tt-pl-nav');
+    nav.setAttribute('aria-label', 'あとでプレイの表示');
+    const select = show => {
+      host.toggleAttribute('data-tt-pl-show-saved', show);
+      stock.setAttribute('aria-pressed', String(!show));
+      showPanel(ctx, show);
+    };
+    const stock = button('標準リスト', () => select(false));
+    const tab = button('拡張プレイリスト', () => select(true), 'tt-pl-btn tt-pl-tab');
+    ctx.tab = tab;
+    ctx.nav = nav;
+    select(false);
+    nav.append(stock, tab);
+    list.before(nav);
+    list.after(ctx.panel);
+    ctx.disconnect = () => {
+      host.classList.remove('tt-pl-standard');
+      host.removeAttribute('data-tt-pl-show-saved');
+    };
+  }
+
+  function detailId() {
+    return movieId(location.pathname.match(/^\/movie\/show\/(\d+)\/?$/)?.[1]);
+  }
+
+  function detailAnchor(id) {
+    const native = [...document.querySelectorAll(DETAIL_ADD)].find(node =>
+      node.getAttribute('data-play-later-movie-id-param') === id &&
+      (node.matches('[data-play-later-target~="addBtn"]') || hasAction(node, 'play-later#toggle')));
+    return document.querySelector(DETAIL_CTA) || native || document.querySelector('main h1, h1');
+  }
+
+  function detailSong(id) {
+    return movie({
+      id,
+      title: document.querySelector('meta[property="og:title"]')?.content ||
+        document.querySelector('main h1, h1')?.textContent || document.title,
+      thumbnail_url: document.querySelector('meta[property="og:image"]')?.content
+    });
+  }
+
+  function toggleDetail(ctx, open) {
+    if (open) {
+      ctx.song = detailSong(ctx.song.id);
+      const saved = readDb().songs.find(s => s.id === ctx.song.id);
+      ctx.membership = new Set(saved?.folders || []);
+    }
+    ctx.panel.hidden = !open;
+    ctx.tab.setAttribute('aria-expanded', String(open));
+    say(ctx, '');
+    redraw(ctx);
+  }
+
+  function mountDetail(anchor, id) {
+    if (!anchor || mounted.has(anchor)) return;
+    const ctx = panelContext('detail', anchor, anchor.parentElement);
+    ctx.anchor = anchor;
+    ctx.song = detailSong(id);
+    const wrap = el('div', 'tt-pl-detail');
+    ctx.nav = wrap;
+    ctx.tab = button('拡張プレイリストに保存', act(ctx, () => {
+      try {
+        toggleDetail(ctx, ctx.panel.hidden);
+      } catch (error) {
+        ctx.panel.hidden = false;
+        ctx.tab.setAttribute('aria-expanded', 'true');
+        report(ctx, error);
+      }
+    }));
+    ctx.tab.setAttribute('aria-expanded', 'false');
+    wrap.append(ctx.tab, ctx.panel);
+    anchor.after(wrap);
+    redraw(ctx);
   }
 
   function remove(ctx) {
+    ctx.remote?.request?.abort();
     ctx.disconnect?.();
-    if (ctx.tab.classList.contains('active') && ctx.previous?.isConnected) ctx.previous.classList.add('active');
+    ctx.nav?.remove();
     ctx.tab.remove();
     ctx.panel.remove();
-    ctx.modal.classList.remove('tt-pl-modal');
-    mounted.delete(ctx.modal);
+    mounted.delete(ctx.key);
   }
 
   function mount() {
+    if (suspended) return;
+    const id = detailId();
+    const anchor = id ? detailAnchor(id) : null;
     for (const ctx of mounted.values()) {
-      if (!ctx.modal.isConnected || !ctx.tab.isConnected || !ctx.panel.isConnected) remove(ctx);
+      if (!ctx.key.isConnected || !ctx.host.isConnected || !ctx.anchor.isConnected ||
+          !ctx.tab.isConnected || !ctx.panel.isConnected ||
+          (ctx.kind === 'detail' && (ctx.anchor !== anchor || ctx.song.id !== id)) ||
+          (ctx.kind === 'room' && roomIdFor(ctx.host) !== ctx.roomId)) remove(ctx);
     }
-    for (const modal of document.querySelectorAll(MODAL)) {
-      if (mounted.has(modal) || !modal.closest('[data-controller~="battle-room"]')) continue;
-      const tabs = modal.querySelector('.room-search-tabs');
-      const search = tabs?.querySelector(NATIVE_SEARCH);
-      const later = tabs?.querySelector(NATIVE_LATER);
-      const results = modal.querySelector(TARGET('songSearchResults'));
-      if (!search || !later || !results || !modal.querySelector(TARGET('songSearchPane'))) continue;
-      modal.querySelectorAll('.tt-pl-tab, .tt-pl-panel').forEach(node => node.remove());
-      const tab = button('拡張プレイリスト', null, 'room-search-tab tt-pl-tab');
-      const panel = el('section', 'tt-pl-panel');
-      panel.setAttribute('aria-label', '拡張プレイリスト');
-      const status = el('p', 'tt-pl-note tt-pl-status');
-      status.setAttribute('role', 'status');
-      const content = el('div', 'tt-pl-panel-content');
-      panel.append(status, content);
-      tabs.append(tab);
-      results.after(panel);
-      modal.classList.add('tt-pl-modal');
-      const ctx = { modal, tab, panel, status, content, folder: ROOT, view: 'browse', query: '', previous: search };
-      mounted.set(modal, ctx);
-      tab.setAttribute('aria-pressed', 'false');
-      tab.addEventListener('click', () => {
-        ctx.previous = tabs.querySelector('.room-search-tab.active:not(.tt-pl-tab)') || ctx.previous;
-        for (const other of tabs.querySelectorAll('.room-search-tab')) other.classList.toggle('active', other === tab);
-        tab.setAttribute('aria-pressed', 'true');
-        if (!ctx.rendered) { redraw(ctx); ctx.rendered = true; }
-      });
-      const activeObserver = new MutationObserver(() => {
-        const pressed = String(tab.classList.contains('active'));
-        if (tab.getAttribute('aria-pressed') !== pressed) tab.setAttribute('aria-pressed', pressed);
-      });
-      activeObserver.observe(tab, { attributes: true, attributeFilter: ['class'] });
-      ctx.disconnect = () => activeObserver.disconnect();
-    }
+    document.querySelectorAll(ROOM_TABS).forEach(mountRoom);
+    document.querySelectorAll(LATER_PANEL).forEach(mountStandard);
+    if (anchor) mountDetail(anchor, id);
   }
 
   function scheduleMount() {
-    if (mounting) return;
+    if (mounting || suspended) return;
     mounting = true;
     requestAnimationFrame(() => { mounting = false; mount(); });
   }
 
-  function touchesModal(element) {
-    return element instanceof Element && (element.matches(MODAL) || !!element.querySelector(MODAL) ||
-      element.matches('.room-search-tabs, ' + TARGET('songSearchResults')));
+  const mountNodes = [ROOM_TABS, MODAL, TARGET('songSearchPane'), TARGET('songSearchResults'),
+    LATER_PANEL, LATER_LIST, DETAIL_ADD, DETAIL_CTA, 'h1', '.tt-pl-nav', '.tt-pl-tab', '.tt-pl-detail'].join(', ');
+  function touchesMount(element) {
+    return element instanceof Element && (element.matches(mountNodes) || !!element.querySelector(mountNodes));
   }
 
   new MutationObserver(records => {
-    if (records.some(record => [...record.addedNodes, ...record.removedNodes].some(touchesModal) ||
-      (record.target instanceof Element && record.target.matches(MODAL + ', .room-search-tabs')))) scheduleMount();
-  }).observe(document.documentElement, { childList: true, subtree: true });
-  document.addEventListener('turbo:load', scheduleMount);
+    if (records.some(record => record.type === 'attributes' ||
+      [...record.addedNodes, ...record.removedNodes].some(touchesMount))) scheduleMount();
+  }).observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true,
+    attributeFilter: ['data-battle-room-target', 'data-play-later-target', 'data-movie-detail-target',
+      'data-play-later-movie-id-param', 'data-battle-room-room-id-value', 'data-action']
+  });
+  for (const event of ['turbo:render', 'turbo:load']) {
+    document.addEventListener(event, () => { suspended = false; scheduleMount(); });
+  }
   document.addEventListener('turbo:before-cache', () => {
+    suspended = true;
     for (const ctx of mounted.values()) remove(ctx);
   });
   GM_addValueChangeListener(KEY, (_key, _old, _new, remote) => { if (remote) redrawAll(); });

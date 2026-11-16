@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.1.7
-// @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト
+// @version      8.1.8
+// @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト・対戦ルームの欄の並べ替え
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
   if (window.top !== window || document.documentElement.hasAttribute('data-tt-extended-playlist')) return;
-  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.7');
+  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.8');
 
   const KEY = 'tt-extended-playlist-v1';
   const HISTORY_KEY = 'tt-extended-playlist-proposal-history-v1';
@@ -29,11 +29,22 @@
   const TABS_KEY = 'tt-extended-playlist-tabs-v1';
   const RANDOM_VISIBLE_KEY = 'tt-extended-playlist-random-visible-v1';
   const RANDOM_SETTINGS_KEY = 'tt-extended-playlist-random-settings-v1';
+  const ROOM_ORDER_KEY = 'tt-battle-room-panel-order-v1';
   const HISTORY_MAX = 1000;
   const GAP_DEFAULT = 10;
   const SEARCH_DELAY = 400;
   const MODAL = '[data-battle-room-target~="songSearchModal"]';
   const TARGET = name => `[data-battle-room-target~="${name}"]`;
+  const ROOM_CONTROLLER = '[data-controller~="battle-room"]';
+  const ROOM_CONTENT = '.room-content';
+  const ROOM_SECTIONS = [
+    ['song', '次の曲', TARGET('songSection')],
+    ['players', 'プレイヤー', TARGET('playerList')],
+    ['settings', 'ルーム設定', TARGET('settingsSection')],
+    ['handicap', 'ハンデ設定', TARGET('handicapSection')],
+    ['spectators', '観戦者欄', `.room-spectator-section, ${TARGET('spectatorList')}`],
+    ['chat', 'ルーム内チャット', `.room-chat-section, ${TARGET('chatMessages')}`]
+  ];
   const ROOM_TABS = '.room-search-tabs';
   const ROOM_SEARCH_OPENER = '.room-browse-songs-btn';
   const LATER_PANEL = '[data-play-later-target~="panel"]';
@@ -43,6 +54,7 @@
   const ROOT = '';
   const VIEWS = [['browse', '選択'], ['search', '検索'], ['more', 'その他']];
   const mounted = new Map();
+  const roomLayouts = new Map();
   let serial = 0;
   let activePicker = null;
   let positioningPicker = false;
@@ -50,11 +62,19 @@
   let suspended = false;
   let writes = Promise.resolve();
   let historyWrites = Promise.resolve();
+  let historyScope = null;
   let proposalGap = gapValue(GM_getValue(GAP_KEY, GAP_DEFAULT)) ?? GAP_DEFAULT;
-  let proposalHistory = historyValue(GM_getValue(HISTORY_KEY, []));
-  let recentProposals = recentProposalIds();
+  let proposalHistory = [];
+  let recentProposals = new Set();
 
   GM_addStyle(`
+    .room-content > .room-section[data-tt-room-panel] { position: relative; }
+    .room-content > .room-section[data-tt-room-panel] > :is(.room-section-title, [data-battle-room-target~="spectatorList"]) { padding-inline-end: 4.75rem; }
+    .room-content > .room-section[data-tt-room-panel] > .tt-room-order-controls { position: absolute; inset-block-start: .5rem; inset-inline-end: .6rem; display: flex; gap: .25rem; }
+    .room-content .tt-room-move { box-sizing: border-box; display: inline-grid; place-items: center; inline-size: 1.9rem; block-size: 1.9rem; padding: 0; border: 1px solid color-mix(in srgb, currentColor 38%, transparent); border-radius: .35rem; background: transparent; color: inherit; font: inherit; font-size: 1rem; font-weight: 600; line-height: 1; cursor: pointer; }
+    .room-content .tt-room-move:enabled:hover { background: color-mix(in srgb, currentColor 12%, transparent); }
+    .room-content .tt-room-move:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+    .room-content .tt-room-move:disabled { opacity: .32; cursor: default; }
     .tt-pl-modal[data-tt-pl-room-open] :is([data-battle-room-target~="songSearchPane"], [data-battle-room-target~="songSearchStatus"], [data-battle-room-target~="songSearchResults"], .room-search-status, .room-search-results) { display: none !important; }
     .tv-modal-content[data-tt-pl-wide] { box-sizing: border-box; width: min(1200px, calc(100vw - 24px)) !important; max-width: 100% !important; min-width: 0; }
     .tv-modal-content[data-tt-pl-wide] .tv-modal-body { min-width: 0; }
@@ -330,6 +350,21 @@
     });
   }
 
+  function historyState(value) {
+    return { roomId: movieId(value?.roomId), entries: historyValue(value?.entries) };
+  }
+
+  function useHistoryRoom(roomId) {
+    if (roomId === (historyScope?.roomId || '')) return;
+    const previous = historyScope;
+    const saved = historyState(GM_getValue(HISTORY_KEY, null));
+    historyScope = roomId ? { roomId } : null;
+    const restore = roomId && !previous && saved.roomId === roomId;
+    proposalHistory = restore ? saved.entries : [];
+    if (roomId && !restore) GM_setValue(HISTORY_KEY, { roomId, entries: [] });
+    refreshHistory();
+  }
+
   function recentProposalIds() {
     return new Set(proposalGap > 0 ? proposalHistory.slice(-proposalGap).map(song => song.id) : []);
   }
@@ -350,26 +385,30 @@
     refreshHistory(true);
   }
 
-  function changeHistory(update, keepInMemory = false) {
+  function changeHistory(scope, update, keepInMemory = false) {
     const task = historyWrites.then(async () => {
-      const history = historyValue(GM_getValue(HISTORY_KEY, proposalHistory));
+      if (!scope || scope !== historyScope) return false;
+      const saved = historyState(GM_getValue(HISTORY_KEY, null));
+      const history = saved.roomId === scope.roomId ? saved.entries : proposalHistory;
       const next = update(history).slice(-HISTORY_MAX);
       if (keepInMemory) {
         proposalHistory = next;
         refreshHistory();
       }
-      await GM_setValue(HISTORY_KEY, next);
+      await GM_setValue(HISTORY_KEY, { roomId: scope.roomId, entries: next });
+      if (scope !== historyScope) return false;
       if (!keepInMemory) {
         proposalHistory = next;
         refreshHistory();
       }
+      return true;
     });
     historyWrites = task.catch(() => {});
     return task;
   }
 
-  function recordProposal(song) {
-    return changeHistory(history => [...history, { id: song.id, title: song.title }], true)
+  function recordProposal(scope, song) {
+    return changeHistory(scope, history => [...history, { id: song.id, title: song.title }], true)
       .catch(error => console.warn('提案履歴を保存できませんでした。', error));
   }
 
@@ -720,8 +759,123 @@
 
   function roomIdFor(node) {
     const route = movieId(location.pathname.match(/^\/battle\/(\d+)\/?$/)?.[1]);
-    const controller = node.closest('[data-controller~="battle-room"]');
+    const controller = node?.closest(ROOM_CONTROLLER);
     return route || movieId(controller?.getAttribute('data-battle-room-room-id-value'));
+  }
+
+  function roomOrder() {
+    const ids = ROOM_SECTIONS.map(([id]) => id);
+    const saved = GM_getValue(ROOM_ORDER_KEY, []);
+    return [...new Set([...(Array.isArray(saved) ? saved.filter(id => ids.includes(id)) : []), ...ids])];
+  }
+
+  function roomCards(root, layout, visible = false) {
+    return Array.from(root.children).flatMap(node => {
+      const card = layout.cards.get(node);
+      if (!card || visible && (node.hidden || node.classList.contains('is-hidden') || !node.getClientRects().length)) return [];
+      return [card];
+    });
+  }
+
+  function syncRoomArrows(root, layout) {
+    const shown = roomCards(root, layout, true);
+    for (const card of layout.cards.values()) {
+      const index = shown.indexOf(card);
+      card.up.disabled = index <= 0;
+      card.down.disabled = index < 0 || index >= shown.length - 1;
+    }
+  }
+
+  function arrangeRoom(root, layout, order) {
+    const current = roomCards(root, layout);
+    const desired = current.slice().sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    const move = (node, reference) => {
+      if (typeof root.moveBefore === 'function') root.moveBefore(node, reference);
+      else if (reference) reference.before(node);
+      else root.append(node);
+    };
+    for (let i = 0; i < desired.length; i++) {
+      const j = current.indexOf(desired[i]);
+      if (i === j) continue;
+      const first = current[i].node;
+      const second = current[j].node;
+      const adjacent = first.nextElementSibling === second;
+      const after = second.nextElementSibling;
+      move(second, first);
+      if (!adjacent) move(first, after);
+      [current[i], current[j]] = [current[j], current[i]];
+    }
+    syncRoomArrows(root, layout);
+  }
+
+  function moveRoomCard(root, layout, card, direction) {
+    const shown = roomCards(root, layout, true);
+    const index = shown.indexOf(card);
+    const neighbor = shown[index + direction];
+    if (index < 0 || !neighbor) return;
+    const order = roomOrder();
+    const from = order.indexOf(card.id), to = order.indexOf(neighbor.id);
+    [order[from], order[to]] = [order[to], order[from]];
+    GM_setValue(ROOM_ORDER_KEY, order);
+    arrangeRoom(root, layout, order);
+    const [same, other] = direction < 0 ? [card.up, card.down] : [card.down, card.up];
+    (same.disabled ? other : same).focus();
+  }
+
+  function mountRoomLayout(root) {
+    if (!roomIdFor(root)) return;
+    let layout = roomLayouts.get(root);
+    if (!layout) {
+      layout = { cards: new Map(), observer: new MutationObserver(() => syncRoomArrows(root, layout)) };
+      roomLayouts.set(root, layout);
+    }
+    let changed = false;
+    for (const [node, card] of layout.cards) {
+      if (node.parentElement === root && card.controls.parentElement === node) continue;
+      card.controls.remove();
+      node.removeAttribute('data-tt-room-panel');
+      layout.cards.delete(node);
+      changed = true;
+    }
+    const used = new Set([...layout.cards.values()].map(card => card.id));
+    for (const node of Array.from(root.children)) {
+      if (!node.classList.contains('room-section') || layout.cards.has(node)) continue;
+      const section = ROOM_SECTIONS.find(([id, , selector]) => !used.has(id) && (node.matches(selector) || node.querySelector(selector)));
+      if (!section) continue;
+      const [id, title] = section;
+      used.add(id);
+      const card = { id, node, controls: el('div', 'tt-room-order-controls') };
+      card.controls.setAttribute('role', 'group');
+      card.controls.setAttribute('aria-label', `${title}の並べ替え`);
+      const arrow = (icon, direction, label) => {
+        const btn = button(icon, () => moveRoomCard(root, layout, card, direction), 'tt-room-move');
+        btn.setAttribute('aria-label', `「${title}」を${label}へ移動`);
+        btn.title = `「${title}」を${label}へ移動`;
+        return btn;
+      };
+      card.up = arrow('↑', -1, '上');
+      card.down = arrow('↓', 1, '下');
+      card.controls.append(card.up, card.down);
+      node.querySelector(':scope > .tt-room-order-controls')?.remove();
+      node.setAttribute('data-tt-room-panel', id);
+      node.prepend(card.controls);
+      layout.cards.set(node, card);
+      changed = true;
+    }
+    if (changed) {
+      layout.observer.disconnect();
+      for (const node of layout.cards.keys()) layout.observer.observe(node, { attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
+    }
+    arrangeRoom(root, layout, roomOrder());
+  }
+
+  function removeRoomLayout(root, layout) {
+    layout.observer.disconnect();
+    for (const card of layout.cards.values()) {
+      card.controls.remove();
+      card.node.removeAttribute('data-tt-room-panel');
+    }
+    roomLayouts.delete(root);
   }
 
   function requireRoom(ctx) {
@@ -777,11 +931,12 @@
     if ((ctx.randomBatch && ctx.randomBatch !== batch) || ctx.proposals.has(song.id) ||
         (batch ? recentProposals.has(song.id) : proposed.has(song.id))) return false;
     const endpoint = requireRoom(ctx);
+    const scope = historyScope;
     const csrf = document.querySelector('meta[name="csrf-token"]')?.content;
     if (!csrf) throw new Error('提案するには、ログインした状態でページを読み直してください。');
     const body = { movie_id: song.id };
     const modal = ctx.host.closest(MODAL);
-    const room = ctx.host.closest('[data-controller~="battle-room"]');
+    const room = ctx.host.closest(ROOM_CONTROLLER);
     const zone = (modal || ctx.host).querySelector(TARGET('proposalZoneLayout')) || room?.querySelector(TARGET('proposalZoneLayout'));
     if (zone?.value) body.zone_layout = zone.value;
     ctx.proposals.set(song.id, 'pending');
@@ -801,7 +956,7 @@
         throw new Error(message || `提案できませんでした（HTTP ${response.status}）。`);
       }
       proposed.add(song.id);
-      await recordProposal(song);
+      if (scope?.roomId === ctx.roomId && roomIdFor(ctx.host) === ctx.roomId) await recordProposal(scope, song);
       if (!batch && ctx.proposedInWindow === proposed) say(ctx, `「${song.title}」を提案しました。`);
       return true;
     } finally {
@@ -1246,10 +1401,10 @@
       if (ctx.randomBatch || resettingHistory || !proposalHistory.length) return;
       if (!window.confirm('この拡張の提案履歴をリセットしますか？')) return;
       resettingHistory = true;
+      const scope = historyScope;
       state.syncControls();
       try {
-        await changeHistory(() => []);
-        say(ctx, '提案履歴をリセットしました。');
+        if (await changeHistory(scope, () => [])) say(ctx, '提案履歴をリセットしました。');
       } finally {
         resettingHistory = false;
         state.syncControls();
@@ -1381,7 +1536,7 @@
       say(ctx, !show && ctx.randomBatch ? ctx.randomChoice?.resultText || '' : '');
       redraw(ctx);
       ctx.content.querySelector('.tt-pl-random-toggle')?.focus({ preventScroll: true });
-      if (show) focusRandomCount(ctx);
+      if (show) focusPlaylistInput(ctx);
     }), 'tt-pl-btn tt-pl-random-toggle');
     toggle.setAttribute('aria-expanded', String(ctx.randomVisible));
     controls.append(toggle);
@@ -1454,12 +1609,14 @@
     }
   }
 
-  function focusRandomCount(ctx) {
-    if (ctx.view !== 'browse' || !ctx.panel.isConnected || ctx.panel.hidden || ctx.host.hidden || ctx.host.classList.contains('is-hidden')) return;
-    const input = ctx.content.querySelector('input[aria-label="選曲する曲数"]');
-    if (!input || input.disabled || !input.getClientRects().length) return;
+  function focusPlaylistInput(ctx) {
+    if (!ctx.panel.isConnected || ctx.panel.hidden || ctx.host.hidden || ctx.host.classList.contains('is-hidden')) return false;
+    const input = ctx.view === 'search' ? ctx.searchUI?.input : ctx.view === 'browse' ?
+      ctx.content.querySelector('input[aria-label="選曲する曲数"]') : null;
+    if (!input || input.disabled || !input.getClientRects().length) return false;
     input.focus();
-    input.select?.();
+    if (ctx.view === 'browse') input.select?.();
+    return true;
   }
 
   function selectView(ctx, view, focus = true) {
@@ -1470,7 +1627,7 @@
     say(ctx, '');
     redraw(ctx);
     if (view === 'search') resumeSearch(ctx);
-    if (view === 'browse' && focus) focusRandomCount(ctx);
+    if (focus) focusPlaylistInput(ctx);
   }
 
   function redraw(ctx) {
@@ -1548,7 +1705,7 @@
           event.preventDefault();
           const nextView = VIEWS[next][0];
           selectView(ctx, nextView, false);
-          ctx.innerTabs.get(nextView).focus();
+          if (nextView !== 'search' || !focusPlaylistInput(ctx)) ctx.innerTabs.get(nextView).focus();
         });
         ctx.innerTabs.set(view, tab);
         nav.append(tab);
@@ -1575,7 +1732,7 @@
       redraw(ctx);
     }
     if (show && ctx.view === 'search') resumeSearch(ctx);
-    if (opening && focus) focusRandomCount(ctx);
+    if (opening && focus) focusPlaylistInput(ctx);
   }
 
   function hasAction(node, name) {
@@ -1757,6 +1914,7 @@
 
   function mount() {
     if (suspended) return;
+    useHistoryRoom(roomIdFor(document.querySelector(ROOM_CONTROLLER)));
     const id = detailId();
     const anchor = id ? detailAnchor(id) : null;
     for (const ctx of mounted.values()) {
@@ -1766,6 +1924,10 @@
           (ctx.kind === 'room' && (roomIdFor(ctx.host) !== ctx.roomId ||
             !ctx.key.contains(ctx.tab) || ctx.nativeTabs.some(tab => !ctx.key.contains(tab))))) remove(ctx);
     }
+    for (const [root, layout] of roomLayouts) {
+      if (!root.isConnected || !roomIdFor(root)) removeRoomLayout(root, layout);
+    }
+    document.querySelectorAll(ROOM_CONTENT).forEach(mountRoomLayout);
     document.querySelectorAll(ROOM_TABS).forEach(mountRoom);
     document.querySelectorAll(LATER_PANEL).forEach(mountStandard);
     if (anchor) mountDetail(anchor, id);
@@ -1777,7 +1939,7 @@
     requestAnimationFrame(() => { mounting = false; mount(); });
   }
 
-  const mountNodes = [ROOM_TABS, MODAL, '.room-search-tab', '[data-tt-pl-room-panel]',
+  const mountNodes = [ROOM_CONTENT, ROOM_CONTROLLER, ROOM_TABS, MODAL, '.room-search-tab', '[data-tt-pl-room-panel]',
     LATER_PANEL, LATER_LIST, DETAIL_ADD, DETAIL_CTA, 'h1', '.tt-pl-nav', '.tt-pl-tab', '.tt-pl-detail'].join(', ');
   function touchesMount(element) {
     return element instanceof Element && (element.matches(mountNodes) || !!element.querySelector(mountNodes));
@@ -1785,6 +1947,7 @@
 
   new MutationObserver(records => {
     if (records.some(record => record.type === 'attributes' ||
+      (record.target instanceof Element && record.target.matches(ROOM_CONTENT)) ||
       [...record.addedNodes, ...record.removedNodes].some(touchesMount))) scheduleMount();
   }).observe(document.documentElement, {
     childList: true, subtree: true, attributes: true,
@@ -1800,17 +1963,22 @@
   }, true);
   document.addEventListener('scroll', queuePickerPosition, { capture: true, passive: true });
   window.addEventListener('resize', queuePickerPosition);
+  window.addEventListener('popstate', scheduleMount);
   for (const event of ['turbo:render', 'turbo:load']) {
     document.addEventListener(event, () => { suspended = false; scheduleMount(); });
   }
   document.addEventListener('turbo:before-cache', () => {
     suspended = true;
     for (const ctx of mounted.values()) remove(ctx);
+    for (const [root, layout] of roomLayouts) removeRoomLayout(root, layout);
   });
   GM_addValueChangeListener(KEY, (_key, _old, _new, remote) => { if (remote) redrawAll(); });
+  GM_addValueChangeListener(ROOM_ORDER_KEY, (_key, _old, _new, remote) => { if (remote) scheduleMount(); });
   GM_addValueChangeListener(HISTORY_KEY, (_key, _old, value, remote) => {
     if (!remote) return;
-    proposalHistory = historyValue(value);
+    const saved = historyState(value);
+    if (!historyScope || saved.roomId !== historyScope.roomId) return;
+    proposalHistory = saved.entries;
     refreshHistory();
   });
   GM_addValueChangeListener(GAP_KEY, (_key, _old, value, remote) => {

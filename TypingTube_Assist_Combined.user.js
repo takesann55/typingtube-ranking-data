@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.1.4
+// @version      8.1.6
 // @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
@@ -21,11 +21,13 @@
 (() => {
   'use strict';
   if (window.top !== window || document.documentElement.hasAttribute('data-tt-extended-playlist')) return;
-  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.4');
+  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.6');
 
   const KEY = 'tt-extended-playlist-v1';
   const HISTORY_KEY = 'tt-extended-playlist-proposal-history-v1';
   const GAP_KEY = 'tt-extended-playlist-proposal-gap-v1';
+  const TABS_KEY = 'tt-extended-playlist-tabs-v1';
+  const RANDOM_VISIBLE_KEY = 'tt-extended-playlist-random-visible-v1';
   const HISTORY_MAX = 1000;
   const GAP_DEFAULT = 10;
   const SEARCH_DELAY = 400;
@@ -55,6 +57,9 @@
     .tt-pl-modal[data-tt-pl-room-open] :is([data-battle-room-target~="songSearchPane"], [data-battle-room-target~="songSearchStatus"], [data-battle-room-target~="songSearchResults"], .room-search-status, .room-search-results) { display: none !important; }
     .tv-modal-content[data-tt-pl-wide] { box-sizing: border-box; width: min(1200px, calc(100vw - 24px)) !important; max-width: 100% !important; min-width: 0; }
     .tv-modal-content[data-tt-pl-wide] .tv-modal-body { min-width: 0; }
+    .tv-modal-content[data-tt-pl-wide]:is([data-tt-pl-room-open], [data-tt-pl-room-open] *) { display: flex; flex-direction: column; max-height: calc(100vh - 24px) !important; max-height: calc(100dvh - 24px) !important; overflow: hidden; }
+    .tv-modal-content[data-tt-pl-wide]:is([data-tt-pl-room-open], [data-tt-pl-room-open] *) > .tv-modal-header { flex: none; }
+    .tv-modal-content[data-tt-pl-wide]:is([data-tt-pl-room-open], [data-tt-pl-room-open] *) > .tv-modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; }
     .tt-pl-modal .room-search-tabs { flex-wrap: wrap; min-width: 0; }
     .tt-pl-modal .room-search-tabs > .room-search-tab { flex: 1 1 0; min-width: 0; white-space: normal; padding-inline: clamp(.25rem, 1vw, .8rem); }
     .tt-pl-standard[data-tt-pl-show-saved] :is([data-play-later-target~="list"], [data-play-later-target~="emptyMsg"], [data-play-later-target~="sortBtn"], [data-play-later-target~="count"], [data-action~="click->play-later#clearAll"], [data-action~="play-later#clearAll"]) { display: none !important; }
@@ -82,6 +87,9 @@
     .tt-pl-panel .tt-pl-choices input { flex: none; }
     :is(.tt-pl-panel, .tt-pl-nav, .tt-pl-detail) .tt-pl-btn { cursor: pointer; background: transparent; color: inherit; border: 1px solid currentColor; border-radius: .35rem; padding: .3rem .55rem; font: inherit; text-decoration: none; }
     .tt-pl-panel .tt-pl-btn:disabled { opacity: .55; cursor: default; }
+    .tt-pl-panel .tt-pl-toolbar .tt-pl-btn.tt-pl-random-toggle { margin-inline-start: auto; border-color: #f59d4e; background: #f59d4e; color: #211508; font-weight: 700; }
+    .tt-pl-panel .tt-pl-toolbar .tt-pl-btn.tt-pl-random-toggle:hover { background: #ffbb7f; }
+    .tt-pl-panel .tt-pl-toolbar .tt-pl-btn.tt-pl-random-toggle:focus-visible { outline: 2px solid #f59d4e; outline-offset: 2px; }
     .tt-pl-panel .tt-pl-song-actions :is(.tt-pl-btn.tt-pl-register, [data-tt-pl-propose]) { box-sizing: border-box; flex: 0 0 4.75em; inline-size: 4.75em; padding-inline: .25em; white-space: nowrap; }
     .tt-pl-panel .tt-pl-select { appearance: auto; padding: .3rem .35rem; white-space: nowrap; max-width: 100%; }
     .tt-pl-panel .tt-pl-select option { color: CanvasText; background: Canvas; }
@@ -107,8 +115,10 @@
     .tt-pl-panel .tt-pl-random-check input { flex: none; }
     .tt-pl-panel .tt-pl-random-count { display: inline-flex; gap: .35rem; align-items: center; }
     .tt-pl-panel .tt-pl-random-count input { box-sizing: border-box; width: 5.5rem; padding: .3rem; }
-    .tt-pl-panel .tt-pl-history summary { cursor: pointer; }
-    .tt-pl-panel .tt-pl-history ol { max-height: 9rem; overflow: auto; margin-block: .2rem; overflow-wrap: anywhere; }
+    .tt-pl-panel .tt-pl-history-actions { display: flex; align-items: stretch; gap: .35rem; }
+    .tt-pl-panel .tt-pl-history-actions .tt-pl-btn { line-height: 1.3; font-size: .85em; padding: .32rem .45rem; }
+    .tt-pl-panel .tt-pl-preview summary { cursor: pointer; }
+    .tt-pl-panel .tt-pl-history-list, .tt-pl-panel .tt-pl-preview ol { max-height: 8rem; overflow: auto; margin-block: .2rem; overflow-wrap: anywhere; }
     .tt-pl-panel .tt-pl-more { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(12rem, 100%), 1fr)); gap: .45rem; }
     .tt-pl-panel .tt-pl-more .tt-pl-btn { text-align: start; }
     .tt-pl-panel .tt-pl-note { margin: 0; font-size: .85em; overflow-wrap: anywhere; }
@@ -333,21 +343,55 @@
     refreshHistory(true);
   }
 
-  function recordProposal(song) {
+  function changeHistory(update, keepInMemory = false) {
     const task = historyWrites.then(async () => {
       const history = historyValue(GM_getValue(HISTORY_KEY, proposalHistory));
-      proposalHistory = [...history, { id: song.id, title: song.title }].slice(-HISTORY_MAX);
-      refreshHistory();
-      await GM_setValue(HISTORY_KEY, proposalHistory);
+      const next = update(history).slice(-HISTORY_MAX);
+      if (keepInMemory) {
+        proposalHistory = next;
+        refreshHistory();
+      }
+      await GM_setValue(HISTORY_KEY, next);
+      if (!keepInMemory) {
+        proposalHistory = next;
+        refreshHistory();
+      }
     });
-    historyWrites = task.catch(error => console.warn('提案履歴を保存できませんでした。', error));
-    return historyWrites;
+    historyWrites = task.catch(() => {});
+    return task;
+  }
+
+  function recordProposal(song) {
+    return changeHistory(history => [...history, { id: song.id, title: song.title }], true)
+      .catch(error => console.warn('提案履歴を保存できませんでした。', error));
+  }
+
+  function tabPreferences() {
+    const stored = GM_getValue(TABS_KEY, {});
+    return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+  }
+
+  function rememberTab(kind, area, value) {
+    const saved = tabPreferences();
+    const key = `${kind}:${area}`;
+    if (saved[key] !== value) GM_setValue(TABS_KEY, { ...saved, [key]: value });
+  }
+
+  function savedRandomVisibility() {
+    return GM_getValue(RANDOM_VISIBLE_KEY, true) === true;
+  }
+
+  function changeBrowseFolder(ctx, id) {
+    if (ctx.folder === id) return;
+    ctx.folder = id;
+    ctx.randomChoice = null;
+    ctx.randomVisible = id === ROOT && savedRandomVisibility();
   }
 
   function openFolder(ctx, id) {
     stopSearch(ctx);
     stopRandomBatch(ctx);
-    ctx.folder = id;
+    changeBrowseFolder(ctx, id);
     ctx.query = '';
     ctx.view = 'browse';
     say(ctx, '');
@@ -1042,7 +1086,10 @@
   }
 
   function batchStatus(ctx, batch, message) {
-    if (ctx.view === 'browse' && ctx.randomChoice === batch.choice && ctx.panel.isConnected) say(ctx, message);
+    batch.choice.resultText = message;
+    if (ctx.view !== 'browse' || ctx.randomChoice !== batch.choice || !ctx.panel.isConnected) return;
+    if (ctx.randomVisible) batch.choice.syncResult?.();
+    else say(ctx, message);
   }
 
   function stopRandomBatch(ctx, announce = false) {
@@ -1059,10 +1106,8 @@
     let sent = 0;
     let skipped = 0;
     let failure = '';
-    batchStatus(ctx, batch, `${total}曲を選びました。表示順に提案します。`);
     try {
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      for (const [index, song] of batch.songs.entries()) {
+      for (const song of batch.songs) {
         if (batch.cancelled || ctx.panel.hidden || !ctx.panel.isConnected || ctx.host.hidden ||
             ctx.host.classList.contains('is-hidden') || ctx.view !== 'browse' || ctx.randomChoice !== batch.choice ||
             roomIdFor(ctx.host) !== ctx.roomId) {
@@ -1071,7 +1116,7 @@
         }
         batch.waiting.delete(song.id);
         if (ctx.proposals.has(song.id) || recentProposals.has(song.id)) { skipped++; continue; }
-        batchStatus(ctx, batch, `${index + 1}/${total}曲目を提案中：${song.title}（送信済み${sent}曲）`);
+        batchStatus(ctx, batch, `${sent}/${total}曲提案完了（送信中…）`);
         try {
           if (await proposeSong(ctx, song, batch)) sent++;
           else skipped++;
@@ -1079,22 +1124,21 @@
           failure = `「${song.title}」の提案で停止しました：${error?.message || '送信できませんでした。'}`;
           break;
         }
-        if (index + 1 < total && !batch.cancelled) await new Promise(resolve => setTimeout(resolve, 300));
       }
     } finally {
       ctx.randomBatch = null;
       syncProposalButtons(ctx);
       ctx.randomChoice?.syncControls?.();
       const left = total - sent - skipped;
-      const heading = failure || (left ? '残りの自動提案を停止しました。' : '自動提案が完了しました。');
-      const summary = `提案${sent}曲${skipped ? `・すでに提案済み${skipped}曲` : ''}${left ? `・未完了${left}曲` : ''}`;
-      batchStatus(ctx, batch, `${heading}（${summary}）`);
+      const summary = `${sent}/${total}曲提案完了しました。${skipped ? `履歴から${skipped}曲をスキップしました。` : ''}`;
+      const reason = failure || (left ? '残りの自動提案を停止しました。' : '');
+      batchStatus(ctx, batch, `${summary}${reason}`);
     }
   }
 
   function renderRandom(ctx, db, folders) {
     if (ctx.randomChoice?.folder !== ctx.folder) {
-      ctx.randomChoice = { folder: ctx.folder, selected: new Set([ctx.folder]), count: '1', nested: false, auto: false, drawn: [] };
+      ctx.randomChoice = { folder: ctx.folder, selected: new Set([ctx.folder]), count: '1', nested: false, auto: false, drawn: [], resultText: '' };
     }
     const state = ctx.randomChoice;
     const visible = new Set([ctx.folder, ...folders.map(folder => folder.id)]);
@@ -1141,63 +1185,103 @@
     gap.setAttribute('aria-label', '直近の提案から除外する曲数');
     gap.addEventListener('change', act(ctx, () => { if (!ctx.randomBatch) setGap(gap.value); }));
     settings.append(el('span', '', '直近の提案から除外'), gap, el('span', '', '曲'));
-    const history = el('details', 'tt-pl-history');
-    const historyTitle = el('summary', 'tt-pl-note');
-    const historyList = el('ol', 'tt-pl-note');
-    history.append(historyTitle, historyList);
-    history.addEventListener('toggle', updateHistoryList);
+    const historyActions = el('div', 'tt-pl-history-actions');
+    const historyList = el('ol', 'tt-pl-note tt-pl-history-list');
+    historyList.id = `${ctx.uid}-proposal-history`;
+    const historyToggle = button('提案履歴', () => {
+      state.historyOpen = !state.historyOpen;
+      updateHistoryList();
+    });
+    historyToggle.setAttribute('aria-controls', historyList.id);
+    let resettingHistory = false;
+    const historyReset = button('履歴をリセット', act(ctx, async () => {
+      if (ctx.randomBatch || resettingHistory || !proposalHistory.length) return;
+      if (!window.confirm('この拡張の提案履歴をリセットしますか？')) return;
+      resettingHistory = true;
+      state.syncControls();
+      try {
+        await changeHistory(() => []);
+        say(ctx, '提案履歴をリセットしました。');
+      } finally {
+        resettingHistory = false;
+        state.syncControls();
+      }
+    }));
+    historyActions.append(historyToggle, historyReset);
     const status = el('p', 'tt-pl-note');
     status.setAttribute('role', 'status');
-    const list = el('div', 'tt-pl-list');
-    list.setAttribute('role', 'group');
-    list.setAttribute('aria-label', 'ランダム選曲の結果');
-    const drawnNote = el('p', 'tt-pl-note');
+    const result = el('p', 'tt-pl-note');
+    result.setAttribute('role', 'status');
+    result.setAttribute('aria-label', 'ランダム選曲の結果');
+    const preview = el('details', 'tt-pl-preview');
+    const previewTitle = el('summary', 'tt-pl-note');
+    const previewList = el('ol', 'tt-pl-note');
+    preview.append(previewTitle, previewList);
+    preview.addEventListener('toggle', updatePreview);
     let pool = [];
-    const draw = act(ctx, async () => {
-      if (ctx.randomBatch) return;
+    async function draw(allowProposal) {
+      if (ctx.randomBatch || resettingHistory) return;
       setGap(gap.value);
-      if (!pool.length) return;
       state.count = number.value;
       const n = Number(state.count);
       if (!Number.isInteger(n) || n < 1) throw new Error('曲数に1以上の整数を入力してください。');
-      const send = ctx.roomId && state.auto;
+      const send = allowProposal && ctx.roomId && state.auto;
       if (send && ctx.proposals.size) throw new Error('送信中の提案が完了してからもう一度押してください。');
-      state.drawn = sampleSongs(pool, n);
+      const drawn = send && state.drawn.length && state.drawnCount === n ? state.drawn : sampleSongs(pool, n);
+      if (!drawn.length) return;
       say(ctx, '');
-      const batch = send ? { choice: state, songs: state.drawn, waiting: new Set(state.drawn.map(song => song.id)), cancelled: false } : null;
-      if (batch) ctx.randomBatch = batch;
-      showResults();
-      if (batch) await runRandomBatch(ctx, batch);
-    });
-    const start = button('ランダム選曲', draw);
+      if (send) {
+        state.drawn = [];
+        state.resultText = '';
+        preview.open = false;
+        const batch = { choice: state, songs: drawn, waiting: new Set(drawn.map(song => song.id)), cancelled: false };
+        ctx.randomBatch = batch;
+        state.syncControls();
+        state.syncResult();
+        await runRandomBatch(ctx, batch);
+      } else {
+        state.drawn = drawn;
+        state.drawnCount = n;
+        state.resultText = `${drawn.length}曲を選びました。`;
+        state.syncResult();
+      }
+    }
+    const start = button('ランダム選曲', act(ctx, () => draw(true)));
     const stop = button('残りを停止', () => stopRandomBatch(ctx, true));
     controls.append(label, start);
-    if (ctx.roomId) controls.append(choice('自動で提案', state.auto, on => { state.auto = on; }), stop);
+    if (ctx.roomId) controls.append(choice('自動で提案', state.auto, on => { state.auto = on; state.syncControls(); }), stop);
     state.syncControls = () => {
       const batch = ctx.randomBatch;
       number.disabled = gap.disabled = !!batch;
       for (const input of checks) input.disabled = !!batch;
-      start.disabled = !pool.length || !!batch;
+      start.disabled = !!batch || resettingHistory || (!pool.length && !(ctx.roomId && state.auto && state.drawn.length));
       stop.hidden = !batch;
       stop.disabled = !!batch?.cancelled;
+      historyReset.disabled = !!batch || resettingHistory || !proposalHistory.length;
     };
     number.addEventListener('input', () => {
       if (ctx.randomBatch) return;
       state.count = number.value;
       resetDraw();
     });
-    number.addEventListener('keydown', event => {
-      if (event.key === 'Enter' && !event.isComposing) {
+    number.addEventListener('keydown', act(ctx, event => {
+      if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229) {
         event.preventDefault();
-        return draw(event);
+        return draw(false);
       }
-    });
+    }));
     function updateHistoryList() {
-      historyTitle.textContent = proposalHistory.length ? `提案履歴（最近${Math.min(20, proposalHistory.length)}曲を表示）` : '提案履歴（まだありません）';
-      if (history.open) historyList.replaceChildren(...proposalHistory.slice(-20).reverse().map(song => el('li', '', `${song.title}（#${song.id}）`)));
+      historyToggle.textContent = proposalHistory.length ? `提案履歴（直近${Math.min(20, proposalHistory.length)}曲）` : '提案履歴（なし）';
+      historyToggle.setAttribute('aria-expanded', String(!!state.historyOpen));
+      historyList.hidden = !state.historyOpen || !proposalHistory.length;
+      if (!historyList.hidden) historyList.replaceChildren(...proposalHistory.slice(-20).reverse().map(song => el('li', '', `${song.title}（#${song.id}）`)));
+      else historyList.replaceChildren();
     }
     state.syncHistory = (gapChanged = false) => {
-      if (gapChanged) gap.value = String(proposalGap);
+      if (gapChanged) {
+        gap.value = String(proposalGap);
+        if (state.drawn.length) clearDraw();
+      }
       const eligible = randomCandidates(db, state);
       pool = eligible.filter(song => !recentProposals.has(song.id));
       const excluded = eligible.length - pool.length;
@@ -1206,29 +1290,42 @@
       state.syncControls();
       updateHistoryList();
     };
-    function showResults() {
-      const drawn = state.drawn;
-      state.syncControls();
-      drawnNote.textContent = `${drawn.length}曲を選びました。`;
-      list.replaceChildren(...drawn.map(song => {
-        const { row, actions } = songCard(song);
-        if (ctx.roomId) actions.prepend(proposalButton(ctx, song));
+    function updatePreview() {
+      previewTitle.textContent = `選曲した曲名（${state.drawn.length}曲）`;
+      previewList.replaceChildren(...(!preview.hidden && preview.open ? state.drawn.map(song => {
+        const row = el('li');
+        const link = el('a', '', song.title);
+        link.href = `/movie/show/${song.id}`;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        row.append(link);
         return row;
-      }));
-      drawnNote.hidden = list.hidden = !drawn.length;
+      }) : []));
+    }
+    state.syncResult = () => {
+      result.textContent = state.resultText;
+      result.hidden = !state.resultText;
+      preview.hidden = !state.drawn.length;
+      updatePreview();
+    };
+    function clearDraw() {
+      state.drawn = [];
+      state.resultText = '';
+      preview.open = false;
+      state.syncResult();
     }
     function resetDraw() {
       say(ctx, '');
-      state.drawn = [];
+      clearDraw();
       state.syncHistory();
-      showResults();
     }
     panel.append(controls, el('p', 'tt-pl-note', folders.length ? 'このフォルダの曲や、下の一覧でチェックしたフォルダから選びます。' :
       'チェックした選曲元から、指定した曲数をランダムに選びます。'), choices, settings,
       el('p', 'tt-pl-note', '指定した曲数だけ別の曲が提案されるまで、同じ曲を候補から外します。0で無効。'),
-      history, status, drawnNote, list);
+      historyActions, historyList, status, result, preview);
+    if (ctx.roomId) controls.after(el('p', 'tt-pl-note', '曲数欄でEnter：選曲のみ。「自動で提案」をオンにしてボタンを押すと提案します。'));
     state.syncHistory();
-    showResults();
+    state.syncResult();
     return { panel, sourceLabel };
   }
 
@@ -1244,15 +1341,31 @@
         ctx.moveFolder = folder.parent;
         selectView(ctx, 'move');
       }), button('フォルダを削除', act(ctx, () => deleteFolder(ctx, folder))));
+    const toggle = button(ctx.randomVisible ? 'ランダム選曲ツールを非表示' : 'ランダム選曲ツールを表示', act(ctx, () => {
+      const show = !ctx.randomVisible;
+      GM_setValue(RANDOM_VISIBLE_KEY, show);
+      ctx.randomVisible = show;
+      say(ctx, !show && ctx.randomBatch ? ctx.randomChoice?.resultText || '' : '');
+      redraw(ctx);
+      ctx.content.querySelector('.tt-pl-random-toggle')?.focus({ preventScroll: true });
+      if (show) focusRandomCount(ctx);
+    }), 'tt-pl-btn tt-pl-random-toggle');
+    toggle.setAttribute('aria-expanded', String(ctx.randomVisible));
+    controls.append(toggle);
+    ctx.content.append(controls);
     const childFolders = children(db, ctx.folder);
-    const random = renderRandom(ctx, db, childFolders);
-    ctx.content.append(controls, random.panel);
+    const random = ctx.randomVisible ? renderRandom(ctx, db, childFolders) : null;
+    if (random) {
+      random.panel.id = `${ctx.uid}-random`;
+      toggle.setAttribute('aria-controls', random.panel.id);
+      ctx.content.append(random.panel);
+    }
     const list = el('div', 'tt-pl-list');
     if (childFolders.length) {
       const sub = el('div');
       sub.setAttribute('role', 'group');
       sub.setAttribute('aria-label', 'この場所のフォルダ');
-      for (const f of childFolders) sub.append(folderRow(f, open, random.sourceLabel(f.id, f.name)));
+      for (const f of childFolders) sub.append(folderRow(f, open, random?.sourceLabel(f.id, f.name)));
       list.append(sub);
     }
     const stored = db.songs.filter(s => folder ? s.folders.includes(folder.id) : s.folders.length === 0)
@@ -1308,13 +1421,23 @@
     }
   }
 
-  function selectView(ctx, view) {
+  function focusRandomCount(ctx) {
+    if (ctx.view !== 'browse' || !ctx.panel.isConnected || ctx.panel.hidden || ctx.host.hidden || ctx.host.classList.contains('is-hidden')) return;
+    const input = ctx.content.querySelector('input[aria-label="選曲する曲数"]');
+    if (!input || input.disabled || !input.getClientRects().length) return;
+    input.focus();
+    input.select?.();
+  }
+
+  function selectView(ctx, view, focus = true) {
     if (view !== 'browse') stopRandomBatch(ctx);
     if (view !== 'search') stopSearch(ctx);
+    if (VIEWS.some(([id]) => id === view)) rememberTab(ctx.kind, 'inner', view);
     ctx.view = view;
     say(ctx, '');
     redraw(ctx);
     if (view === 'search') resumeSearch(ctx);
+    if (view === 'browse' && focus) focusRandomCount(ctx);
   }
 
   function redraw(ctx) {
@@ -1336,7 +1459,7 @@
       const folder = db.folders.find(f => f.id === ctx.folder);
       if (!folder && ctx.folder !== ROOT) {
         stopRandomBatch(ctx);
-        ctx.folder = ROOT;
+        changeBrowseFolder(ctx, ROOT);
       }
       if (ctx.view === 'move' && !folder) ctx.view = 'browse';
       const selected = ctx.view === 'import' ? 'more' : ctx.view === 'move' ? 'browse' : ctx.view;
@@ -1369,7 +1492,10 @@
     status.setAttribute('role', 'status');
     const content = el('div', 'tt-pl-panel-content');
     const uid = `tt-pl-${++serial}`;
-    const ctx = { kind, key, host, uid, panel, status, content, folder: ROOT, view: 'browse', query: '', searchText: '' };
+    const previousView = tabPreferences()[`${kind}:inner`];
+    const view = VIEWS.some(([id]) => id === previousView) ? previousView : 'browse';
+    const ctx = { kind, key, host, uid, panel, status, content, folder: ROOT, view, query: '', searchText: '',
+      randomVisible: kind !== 'detail' && savedRandomVisibility() };
     if (kind !== 'detail') {
       content.id = `${uid}-view`;
       content.setAttribute('role', 'tabpanel');
@@ -1388,7 +1514,7 @@
           if (!Number.isInteger(next)) return;
           event.preventDefault();
           const nextView = VIEWS[next][0];
-          selectView(ctx, nextView);
+          selectView(ctx, nextView, false);
           ctx.innerTabs.get(nextView).focus();
         });
         ctx.innerTabs.set(view, tab);
@@ -1401,7 +1527,8 @@
     return ctx;
   }
 
-  function showPanel(ctx, show) {
+  function showPanel(ctx, show, focus = true) {
+    const opening = show && ctx.panel.hidden;
     if (!show) {
       closePicker(ctx);
       stopRandomBatch(ctx);
@@ -1415,6 +1542,7 @@
       redraw(ctx);
     }
     if (show && ctx.view === 'search') resumeSearch(ctx);
+    if (opening && focus) focusRandomCount(ctx);
   }
 
   function hasAction(node, name) {
@@ -1442,12 +1570,14 @@
     ctx.roomId = roomIdFor(host);
     ctx.proposals = new Map();
     ctx.previous = search;
-    const tab = button('拡張プレイリスト', () => {
+    const activateExtension = (remember = true) => {
+      if (remember) rememberTab('room', 'outer', 'extended');
       ctx.previous = ctx.nativeTabs.find(b => b.classList.contains('active')) || ctx.previous;
       for (const b of ctx.nativeTabs) b.classList.remove('active');
       tab.classList.add('active');
       showPanel(ctx, true);
-    }, 'room-search-tab tt-pl-tab');
+    };
+    const tab = button('拡張プレイリスト', () => activateExtension(), 'room-search-tab tt-pl-tab');
     tab.setAttribute('aria-pressed', 'false');
     ctx.tab = tab;
     host.classList.add('tt-pl-modal');
@@ -1456,31 +1586,44 @@
     else tabs.append(tab);
     ctx.panel.setAttribute('data-tt-pl-room-panel', '');
     tabs.after(ctx.panel);
-    const listener = new MutationObserver(() => {
+    let wasOpen = false;
+    function updateVisibleTab() {
       if (host.hidden || host.classList.contains('is-hidden')) {
-        closePicker(ctx);
-        stopRandomBatch(ctx);
-        stopSearch(ctx);
+        wasOpen = false;
+        showPanel(ctx, false);
+        return;
+      }
+      if (!wasOpen) {
+        wasOpen = true;
+        const saved = tabPreferences()['room:outer'];
+        if (saved === 'extended') { activateExtension(false); return; }
+        const native = saved === 'later' ? later : saved === 'search' ? search : null;
+        if (native && !native.classList.contains('active')) { native.click(); return; }
       }
       showPanel(ctx, tab.classList.contains('active'));
-    });
+    }
+    const listener = new MutationObserver(updateVisibleTab);
     listener.observe(tab, { attributes: true, attributeFilter: ['class'] });
     listener.observe(host, { attributes: true, attributeFilter: ['class', 'hidden'] });
-    const leave = () => {
+    const leave = mode => {
+      rememberTab('room', 'outer', mode);
       tab.classList.remove('active');
       showPanel(ctx, false);
     };
-    search.addEventListener('click', leave);
-    later.addEventListener('click', leave);
+    const selectSearch = () => leave('search');
+    const selectLater = () => leave('later');
+    search.addEventListener('click', selectSearch);
+    later.addEventListener('click', selectLater);
     ctx.disconnect = () => {
       listener.disconnect();
-      search.removeEventListener('click', leave);
-      later.removeEventListener('click', leave);
+      search.removeEventListener('click', selectSearch);
+      later.removeEventListener('click', selectLater);
       if (tab.classList.contains('active') && ctx.previous?.isConnected) ctx.previous.classList.add('active');
       host.removeAttribute('data-tt-pl-room-open');
       host.classList.remove('tt-pl-modal');
       modalContent?.removeAttribute('data-tt-pl-wide');
     };
+    updateVisibleTab();
   }
 
   function mountStandard(host) {
@@ -1492,19 +1635,20 @@
     host.classList.add('tt-pl-standard');
     const nav = el('div', 'tt-pl-nav');
     nav.setAttribute('aria-label', 'あとでプレイの表示');
-    const select = show => {
+    const select = (show, remember = true) => {
+      if (remember) rememberTab('standard', 'outer', show ? 'extended' : 'standard');
       host.toggleAttribute('data-tt-pl-show-saved', show);
       stock.setAttribute('aria-pressed', String(!show));
-      showPanel(ctx, show);
+      showPanel(ctx, show, remember);
     };
     const stock = button('標準リスト', () => select(false));
     const tab = button('拡張プレイリスト', () => select(true), 'tt-pl-btn tt-pl-tab');
     ctx.tab = tab;
     ctx.nav = nav;
-    select(false);
     nav.append(stock, tab);
     list.before(nav);
     list.after(ctx.panel);
+    select(tabPreferences()['standard:outer'] === 'extended', false);
     ctx.disconnect = () => {
       host.classList.remove('tt-pl-standard');
       host.removeAttribute('data-tt-pl-show-saved');

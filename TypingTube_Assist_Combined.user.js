@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.1.8
-// @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト・対戦ルームの欄の並べ替え
+// @version      8.1.10
+// @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト・対戦ルームの欄の並べ替え・プレイ中のフォーカス・かな表示ガイド
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
 // @grant        GM_xmlhttpRequest
@@ -10,6 +10,7 @@
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_addStyle
+// @grant        unsafeWindow
 // @connect      raw.githubusercontent.com
 // @connect      api.github.com
 // @updateURL    https://raw.githubusercontent.com/takesann55/typingtube-ranking-data/main/TypingTube_Assist_Combined.user.js
@@ -21,7 +22,7 @@
 (() => {
   'use strict';
   if (window.top !== window || document.documentElement.hasAttribute('data-tt-extended-playlist')) return;
-  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.8');
+  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.10');
 
   const KEY = 'tt-extended-playlist-v1';
   const HISTORY_KEY = 'tt-extended-playlist-proposal-history-v1';
@@ -4880,5 +4881,236 @@ void(async()=>{
     }
   }
 })();
+})();
+
+(() => {
+  'use strict';
+  const INSTALLED = 'data-tt-bp-installed';
+  if (window.top !== window || document.documentElement.hasAttribute(INSTALLED)) return;
+  document.documentElement.setAttribute(INSTALLED, '');
+
+  const ROOT = '[data-controller~="battle-play"]';
+  const target = name => `[data-battle-play-target~="${name}"]`;
+  const PLAY_AREA = target('typingArea');
+  const SURFACE = `${PLAY_AREA}, ${target('videoArea')}`;
+  const INTERACTIVE = 'button, a[href], input, textarea, select, label, summary, [role="button"], [contenteditable]:not([contenteditable="false"]), .settings-overlay';
+  const FOCUS = 'data-tt-bp-focused';
+  const KANA_VIEW = 'data-tt-bp-kana-view';
+  const modeName = mode => mode === 'kana' ? 'かな入力' : 'ローマ字';
+  let active = null;
+  let timer = null;
+
+  GM_addStyle(`
+    [data-tt-bp-focused] { outline: 2px solid var(--accent-color, #d78e56); outline-offset: -2px; user-select: none; }
+    [data-tt-bp-focused], [data-tt-bp-focused] * { cursor: none !important; }
+    [data-tt-bp-focused] :is(button, a[href], [role="button"]), [data-tt-bp-focused] :is(button, a[href], [role="button"]) * { cursor: pointer !important; }
+    [data-tt-bp-focused] :is(input, textarea, select) { cursor: auto !important; }
+    .tt-bp-focus-note { display: table; margin: .3rem .15rem 0 auto; padding: .15rem .5rem; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: .5rem; background: color-mix(in srgb, currentColor 6%, transparent); font-size: .75rem; pointer-events: none; }
+    [data-tt-bp-kana-view] :is([data-battle-play-target~="typingMain"], .typing-sub, [data-battle-play-target~="typedSub"], [data-battle-play-target~="untypedSub"]) { display: none !important; }
+    .tt-bp-kana-line { font-size: clamp(1.1rem, 3vw, 1.85rem); line-height: 1.65; min-block-size: 1.65em; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .tt-bp-kana-line .tt-bp-kana-done { color: var(--text-muted, currentColor); opacity: .64; }
+    .tt-bp-kana-line .tt-bp-kana-current:not(:empty) { color: #211508; background: #f1af74; box-decoration-break: clone; border-radius: .2em; outline: 1px solid #f1af74; font-weight: 700; }
+  `);
+
+  function controllerFor(root) {
+    try {
+      const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+      return (page.Stimulus || window.Stimulus)?.getControllerForElementAndIdentifier(root, 'battle-play');
+    } catch { return null; }
+  }
+
+  function playable(root, area, controller) {
+    const mode = controller?.typingPlayModeValue;
+    return area.isConnected && !area.closest('[hidden], .is-hidden') && area.getClientRects().length > 0 &&
+      (mode === 'roma' || mode === 'kana') && (controller.gameState === 'playing' || controller.gameState === 'countdown') &&
+      ((!controller.isSpectatorValue && !controller.isWaitingPlayerValue) || controller.isPracticeModeValue === true) &&
+      !root.querySelector('.settings-overlay:not(.is-hidden):not([hidden])');
+  }
+
+  function practiceSwitchable(controller) {
+    return controller.gameState === 'playing' && controller.isSpectatorValue === true && controller.isPracticeModeValue === true &&
+      controller.gameModeValue !== 'line' &&
+      !controller._practiceInitializing && !controller._pendingPracticeStart && controller.lyricsLanguageValue === 'ja' &&
+      !!controller.lyricsData && Array.isArray(controller.nextChar) && !!controller._inputSettings &&
+      typeof controller._applyInputSettings === 'function' && typeof controller._applyPatternOptimisation === 'function' &&
+      typeof controller._updateTypingDisplay === 'function';
+  }
+
+  function allowsGuide(controller) {
+    return controller.gameState === 'playing' && controller.typingPlayModeValue === 'roma' && controller.lyricsLanguageValue === 'ja' &&
+      !controller.isSpectatorValue && !controller.isPracticeModeValue && !controller.isWaitingPlayerValue &&
+      Array.isArray(controller.typingKanaLine) && Array.isArray(controller.nextChar);
+  }
+
+  function updateGuide(state) {
+    if (!state.guide) return;
+    const { controller } = state;
+    const kana = controller.typingKanaLine;
+    const index = controller.currentCharIndex;
+    const next = controller.nextChar;
+    const values = ['', '', ''];
+    if (Array.isArray(kana) && Number.isInteger(index) && index >= 0 && index <= kana.length && Array.isArray(next)) {
+      values[0] = kana.slice(0, index).join('');
+      if (next.length && index < kana.length) {
+        const group = typeof kana[index] === 'string' ? kana[index] : '';
+        const remainder = controller.typingPlayModeValue === 'kana' && typeof next[0] === 'string' &&
+          group.endsWith(next[0]) ? next[0] : group;
+        values[0] += group.slice(0, group.length - remainder.length);
+        values[1] = remainder;
+        values[2] = kana.slice(index + 1).join('');
+      }
+    }
+    for (const [i, span] of state.guide.parts.entries()) {
+      if (span.textContent !== values[i]) span.textContent = values[i];
+    }
+  }
+
+  function hideGuide(state) {
+    if (!state.guide) return;
+    state.guide.observer.disconnect();
+    state.guide.box.remove();
+    state.guide = null;
+    state.area.removeAttribute(KANA_VIEW);
+  }
+
+  function showGuide(state) {
+    if (state.guide) return true;
+    const main = state.area.querySelector(target('typingMain'));
+    if (!main) return false;
+    const box = document.createElement('div');
+    box.className = 'tt-bp-kana-line';
+    box.setAttribute('lang', 'ja');
+    box.setAttribute('aria-label', 'かな表示ガイド');
+    const parts = ['done', 'current', 'next'].map(type => {
+      const span = document.createElement('span');
+      span.className = `tt-bp-kana-${type}`;
+      if (type === 'current') span.setAttribute('aria-current', 'true');
+      return span;
+    });
+    box.append(...parts);
+    main.after(box);
+    const observer = new MutationObserver(() => updateGuide(state));
+    observer.observe(main, { childList: true, subtree: true, characterData: true });
+    state.guide = { box, parts, observer };
+    updateGuide(state);
+    state.area.setAttribute(KANA_VIEW, '');
+    return true;
+  }
+
+  function switchPractice(controller, requested) {
+    if (!practiceSwitchable(controller)) return false;
+    const kana = requested === 'kana';
+    const index = controller.currentCharIndex;
+    if (!Number.isInteger(index) || index < 0) return false;
+    const prior = { mode: controller.typingPlayModeValue, settings: controller._inputSettings,
+      next: controller.nextChar, romanText: controller.alreadyInputRoma };
+    let row = [];
+    if (prior.next.length) {
+      row = kana ? controller.typingKanaLine : controller.lyricsData?.typingArray?.[controller.count - 1];
+      if (!Array.isArray(row) || index >= row.length || !row.every(chunk => kana ? typeof chunk === 'string' : Array.isArray(chunk))) return false;
+    }
+    try {
+      controller.typingPlayModeValue = requested;
+      controller._inputSettings = { ...prior.settings, kanaMode: kana, keyboard: 'normal' };
+      controller._applyInputSettings(controller.settingsController?.getSettings() || {});
+      const next = kana ? row : controller._applyPatternOptimisation(row.map(chunk => chunk.slice()));
+      controller.nextChar = next.slice(index);
+      if (prior.next.length && Array.isArray(controller.typingRomaLine)) {
+        controller.alreadyInputRoma = controller.typingRomaLine.slice(0, index).join('');
+      }
+      controller._updateTypingDisplay();
+      return true;
+    } catch {
+      controller.typingPlayModeValue = prior.mode;
+      controller._inputSettings = prior.settings;
+      controller.nextChar = prior.next;
+      controller.alreadyInputRoma = prior.romanText;
+      return false;
+    }
+  }
+
+  function release() {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (!active) return;
+    const { area, note, extraTabIndex } = active;
+    hideGuide(active);
+    active = null;
+    area.removeAttribute(FOCUS);
+    note.remove();
+    if (extraTabIndex && area.getAttribute('tabindex') === '-1') area.removeAttribute('tabindex');
+    if (document.activeElement === area) area.blur();
+  }
+
+  function tick() {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    const state = active;
+    if (!state) return;
+    const { root, area, controller, note } = state;
+    if (document.activeElement !== area || !playable(root, area, controller)) { release(); return; }
+    if (state.guide && !state.guide.box.isConnected) hideGuide(state);
+    updateGuide(state);
+    const practice = practiceSwitchable(controller);
+    const localScore = practice ? controller.scoreController?.getStatus?.()?.score : null;
+    const score = Number.isFinite(localScore) ? ` · 練習スコア ${Math.round(localScore).toLocaleString('ja-JP')}` : '';
+    const label = state.notice || (practice ? `${modeName(controller.typingPlayModeValue)} · Tab：入力切替${score}` :
+      allowsGuide(controller) ? (state.guide ? 'かな表示 · 入力はローマ字 · Tab：元に戻す' : 'ローマ字 · Tab：かなを表示') :
+      `${modeName(controller.typingPlayModeValue)} · フォーカス中`);
+    if (note.textContent !== label) note.textContent = label;
+    timer = setTimeout(tick, 100);
+  }
+
+  document.addEventListener('click', event => {
+    const node = event.target instanceof Element ? event.target : event.target?.parentElement;
+    if (active && (!active.area.contains(node) || node?.closest(INTERACTIVE))) release();
+    if (!node || event.button !== 0 || node.closest(INTERACTIVE)) return;
+    const surface = node.closest(SURFACE);
+    const root = surface?.closest(ROOT);
+    if (!root) return;
+    const area = root.querySelector(PLAY_AREA);
+    const controller = controllerFor(root);
+    if (!area || active?.area === area || !playable(root, area, controller)) return;
+    const extraTabIndex = !area.hasAttribute('tabindex');
+    if (extraTabIndex) area.setAttribute('tabindex', '-1');
+    area.focus({ preventScroll: true });
+    if (document.activeElement !== area) {
+      if (extraTabIndex) area.removeAttribute('tabindex');
+      return;
+    }
+    const note = document.createElement('span');
+    note.className = 'tt-bp-focus-note';
+    note.setAttribute('role', 'status');
+    area.append(note);
+    area.setAttribute(FOCUS, '');
+    active = { root, area, controller, note, extraTabIndex, guide: null, notice: '' };
+    tick();
+  }, true);
+
+  document.addEventListener('keydown', event => {
+    const state = active;
+    if (!state) return;
+    if (event.key === 'Escape') { release(); return; }
+    if (event.key !== 'Tab' || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing ||
+        event.keyCode === 229 || document.activeElement !== state.area || !playable(state.root, state.area, state.controller)) return;
+    const controller = state.controller;
+    const practice = practiceSwitchable(controller);
+    if (!practice && !allowsGuide(controller)) return;
+    event.preventDefault();
+    if (event.repeat) return;
+    state.notice = '';
+    if (practice) {
+      const requested = controller.typingPlayModeValue === 'kana' ? 'roma' : 'kana';
+      if (!switchPractice(controller, requested)) state.notice = 'この行では入力方式を切り替えられません';
+      else if (requested === 'kana') showGuide(state);
+      else hideGuide(state);
+    } else if (state.guide) hideGuide(state);
+    else if (!showGuide(state)) state.notice = 'この画面ではかな表示を利用できません';
+    tick();
+  }, true);
+  document.addEventListener('focusin', event => { if (active && event.target !== active.area) release(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) release(); });
+  for (const event of ['turbo:before-visit', 'turbo:before-cache']) document.addEventListener(event, release);
+  for (const event of ['blur', 'pagehide']) window.addEventListener(event, release);
 })();
 

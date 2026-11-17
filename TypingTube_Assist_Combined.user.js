@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TypingTube アシスト＋曲ID検索
 // @namespace    https://typing-tube.net/
-// @version      8.1.10
-// @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト・対戦ルームの欄の並べ替え・プレイ中のフォーカス・かな表示ガイド
+// @version      8.1.11
+// @description  チャット識別・フォロー、ユーザーのオンライン確認・ブロック関連機能・コメントリアクション表示切替・コメントメニュー・ライブリアクション・過去ランキング(公開日時付き)から検索・拡張プレイリスト・対戦ルームの欄の並べ替え・プレイ中のフォーカス・かな表示ガイド・個人練習の入力切替
 // @match        https://typing-tube.net/*
 // @match        https://www.typing-tube.net/*
 // @grant        GM_xmlhttpRequest
@@ -22,7 +22,7 @@
 (() => {
   'use strict';
   if (window.top !== window || document.documentElement.hasAttribute('data-tt-extended-playlist')) return;
-  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.10');
+  document.documentElement.setAttribute('data-tt-extended-playlist', '8.1.11');
 
   const KEY = 'tt-extended-playlist-v1';
   const HISTORY_KEY = 'tt-extended-playlist-proposal-history-v1';
@@ -4889,14 +4889,20 @@ void(async()=>{
   if (window.top !== window || document.documentElement.hasAttribute(INSTALLED)) return;
   document.documentElement.setAttribute(INSTALLED, '');
 
-  const ROOT = '[data-controller~="battle-play"]';
-  const target = name => `[data-battle-play-target~="${name}"]`;
-  const PLAY_AREA = target('typingArea');
-  const SURFACE = `${PLAY_AREA}, ${target('videoArea')}`;
+  const BATTLE = 'battle-play';
+  const SOLO = ['typing--game', 'typing-game'];
+  const GAMES = [BATTLE, ...SOLO];
+  const gameRoot = game => `[data-controller~="${game}"]`;
+  const target = (name, game = BATTLE) => `[data-${game}-target~="${name}"]`;
+  const ROOT = GAMES.map(gameRoot).join(', ');
+  const SOLO_ROOT = SOLO.map(gameRoot).join(', ');
+  const SURFACE = [target('typingArea'), target('videoArea'), ...SOLO.flatMap(game => ['typingArea', 'playArea'].map(name => target(name, game)))].join(', ');
+  const NATIVE_GUIDE = GAMES.flatMap(game => ['typingMain', 'typingSub', 'typedSub', 'untypedSub'].map(name => target(name, game))).join(', ');
   const INTERACTIVE = 'button, a[href], input, textarea, select, label, summary, [role="button"], [contenteditable]:not([contenteditable="false"]), .settings-overlay';
   const FOCUS = 'data-tt-bp-focused';
   const KANA_VIEW = 'data-tt-bp-kana-view';
   const modeName = mode => mode === 'kana' ? 'かな入力' : 'ローマ字';
+  const savedSoloModes = new WeakMap();
   let active = null;
   let timer = null;
 
@@ -4906,25 +4912,41 @@ void(async()=>{
     [data-tt-bp-focused] :is(button, a[href], [role="button"]), [data-tt-bp-focused] :is(button, a[href], [role="button"]) * { cursor: pointer !important; }
     [data-tt-bp-focused] :is(input, textarea, select) { cursor: auto !important; }
     .tt-bp-focus-note { display: table; margin: .3rem .15rem 0 auto; padding: .15rem .5rem; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: .5rem; background: color-mix(in srgb, currentColor 6%, transparent); font-size: .75rem; pointer-events: none; }
-    [data-tt-bp-kana-view] :is([data-battle-play-target~="typingMain"], .typing-sub, [data-battle-play-target~="typedSub"], [data-battle-play-target~="untypedSub"]) { display: none !important; }
+    [data-tt-bp-kana-view] :is(${NATIVE_GUIDE}, .typing-sub) { display: none !important; }
     .tt-bp-kana-line { font-size: clamp(1.1rem, 3vw, 1.85rem); line-height: 1.65; min-block-size: 1.65em; white-space: pre-wrap; overflow-wrap: anywhere; }
     .tt-bp-kana-line .tt-bp-kana-done { color: var(--text-muted, currentColor); opacity: .64; }
     .tt-bp-kana-line .tt-bp-kana-current:not(:empty) { color: #211508; background: #f1af74; box-decoration-break: clone; border-radius: .2em; outline: 1px solid #f1af74; font-weight: 700; }
   `);
 
-  function controllerFor(root) {
+  function controllerFor(root, game) {
     try {
       const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-      return (page.Stimulus || window.Stimulus)?.getControllerForElementAndIdentifier(root, 'battle-play');
+      return (page.Stimulus || window.Stimulus)?.getControllerForElementAndIdentifier(root, game);
     } catch { return null; }
   }
 
-  function playable(root, area, controller) {
+  function playAreaFor(root, game) {
+    const typing = root.querySelector(target('typingArea', game));
+    if (game === BATTLE || typing?.querySelector(target('typingMain', game))) return typing;
+    return root.querySelector(target('playArea', game)) || typing;
+  }
+
+  function soloPractice(controller) {
+    const mode = controller?.inputMode;
+    return controller?.practiceMode === true && controller.replayModeValue !== true && controller.stateValue === 'playing' &&
+      controller._playbackStarted === true && (controller.lyricsLanguageValue || 'ja') === 'ja' &&
+      typeof mode?.kanaMode === 'boolean' && ['kana', 'roma'].includes(mode.display) && mode.keyboard !== 'mac' && !mode.inputMethod &&
+      Array.isArray(controller.lyricsData?.typingArray) && Array.isArray(controller.nextChar) &&
+      typeof controller._applyPatternOptimisation === 'function' && typeof controller._updateTypingDisplay === 'function';
+  }
+
+  function playable(root, area, controller, game) {
+    if (!area?.isConnected || area.closest('[hidden], .is-hidden') || !area.getClientRects().length ||
+        root.querySelector('.settings-overlay:not(.is-hidden):not([hidden]), [data-typing--settings-target~="overlay"]:not(.is-hidden):not([hidden])')) return false;
+    if (game !== BATTLE) return soloPractice(controller);
     const mode = controller?.typingPlayModeValue;
-    return area.isConnected && !area.closest('[hidden], .is-hidden') && area.getClientRects().length > 0 &&
-      (mode === 'roma' || mode === 'kana') && (controller.gameState === 'playing' || controller.gameState === 'countdown') &&
-      ((!controller.isSpectatorValue && !controller.isWaitingPlayerValue) || controller.isPracticeModeValue === true) &&
-      !root.querySelector('.settings-overlay:not(.is-hidden):not([hidden])');
+    return (mode === 'roma' || mode === 'kana') && (controller.gameState === 'playing' || controller.gameState === 'countdown') &&
+      ((!controller.isSpectatorValue && !controller.isWaitingPlayerValue) || controller.isPracticeModeValue === true);
   }
 
   function practiceSwitchable(controller) {
@@ -4944,7 +4966,7 @@ void(async()=>{
 
   function updateGuide(state) {
     if (!state.guide) return;
-    const { controller } = state;
+    const { controller, game } = state;
     const kana = controller.typingKanaLine;
     const index = controller.currentCharIndex;
     const next = controller.nextChar;
@@ -4953,7 +4975,8 @@ void(async()=>{
       values[0] = kana.slice(0, index).join('');
       if (next.length && index < kana.length) {
         const group = typeof kana[index] === 'string' ? kana[index] : '';
-        const remainder = controller.typingPlayModeValue === 'kana' && typeof next[0] === 'string' &&
+        const inKana = game === BATTLE ? controller.typingPlayModeValue === 'kana' : controller.inputMode?.kanaMode;
+        const remainder = inKana && typeof next[0] === 'string' &&
           group.endsWith(next[0]) ? next[0] : group;
         values[0] += group.slice(0, group.length - remainder.length);
         values[1] = remainder;
@@ -4975,7 +4998,7 @@ void(async()=>{
 
   function showGuide(state) {
     if (state.guide) return true;
-    const main = state.area.querySelector(target('typingMain'));
+    const main = state.area.querySelector(target('typingMain', state.game));
     if (!main) return false;
     const box = document.createElement('div');
     box.className = 'tt-bp-kana-line';
@@ -5029,6 +5052,38 @@ void(async()=>{
     }
   }
 
+  function switchSolo(controller, toKana) {
+    if (!soloPractice(controller)) return false;
+    const index = controller.currentCharIndex;
+    if (!Number.isInteger(index) || index < 0) return false;
+    const before = controller.inputMode;
+    const beforeNext = controller.nextChar;
+    const beforeRoma = controller.alreadyInputRoma;
+    const saved = savedSoloModes.get(controller);
+    const mode = toKana ? { display: 'kana', kanaMode: true, keyboard: 'normal' } :
+      saved?.kana === before ? { ...saved.roma } : { display: 'kana', kanaMode: false };
+    const row = beforeNext.length ? (toKana ? controller.typingKanaLine : controller.lyricsData.typingArray[controller.count - 1]) : [];
+    if (!Array.isArray(row) || (beforeNext.length && index >= row.length) ||
+        !row.every(chunk => toKana ? typeof chunk === 'string' : Array.isArray(chunk) && chunk.every(x => typeof x === 'string'))) return false;
+    try {
+      controller.inputMode = mode;
+      const next = toKana ? row : controller._applyPatternOptimisation(row.map(chunk => chunk.slice()));
+      controller.nextChar = next.slice(index);
+      if (beforeNext.length && Array.isArray(controller.typingRomaLine)) {
+        controller.alreadyInputRoma = controller.typingRomaLine.slice(0, index).join('');
+      }
+      controller._updateTypingDisplay();
+      if (toKana) savedSoloModes.set(controller, { kana: mode, roma: { ...before } });
+      else savedSoloModes.delete(controller);
+      return true;
+    } catch {
+      controller.inputMode = before;
+      controller.nextChar = beforeNext;
+      controller.alreadyInputRoma = beforeRoma;
+      return false;
+    }
+  }
+
   function release() {
     if (timer !== null) clearTimeout(timer);
     timer = null;
@@ -5047,59 +5102,83 @@ void(async()=>{
     timer = null;
     const state = active;
     if (!state) return;
-    const { root, area, controller, note } = state;
-    if (document.activeElement !== area || !playable(root, area, controller)) { release(); return; }
+    const { root, area, controller, note, game } = state;
+    if (document.activeElement !== area || !playable(root, area, controller, game)) { release(); return; }
     if (state.guide && !state.guide.box.isConnected) hideGuide(state);
     updateGuide(state);
-    const practice = practiceSwitchable(controller);
+    const solo = game !== BATTLE;
+    const practice = solo || practiceSwitchable(controller);
     const localScore = practice ? controller.scoreController?.getStatus?.()?.score : null;
     const score = Number.isFinite(localScore) ? ` · 練習スコア ${Math.round(localScore).toLocaleString('ja-JP')}` : '';
-    const label = state.notice || (practice ? `${modeName(controller.typingPlayModeValue)} · Tab：入力切替${score}` :
+    const inputLabel = solo ? (controller.inputMode.kanaMode ? 'かな入力' :
+      `${controller.inputMode.display === 'roma' ? 'ローマ字表示' : 'かな表示'}のローマ字入力`) : modeName(controller.typingPlayModeValue);
+    const label = state.notice || (practice ? `${inputLabel} · Tab：入力切替${score}` :
       allowsGuide(controller) ? (state.guide ? 'かな表示 · 入力はローマ字 · Tab：元に戻す' : 'ローマ字 · Tab：かなを表示') :
-      `${modeName(controller.typingPlayModeValue)} · フォーカス中`);
+      `${inputLabel} · フォーカス中`);
     if (note.textContent !== label) note.textContent = label;
     timer = setTimeout(tick, 100);
   }
 
-  document.addEventListener('click', event => {
-    const node = event.target instanceof Element ? event.target : event.target?.parentElement;
-    if (active && (!active.area.contains(node) || node?.closest(INTERACTIVE))) release();
-    if (!node || event.button !== 0 || node.closest(INTERACTIVE)) return;
-    const surface = node.closest(SURFACE);
-    const root = surface?.closest(ROOT);
-    if (!root) return;
-    const area = root.querySelector(PLAY_AREA);
-    const controller = controllerFor(root);
-    if (!area || active?.area === area || !playable(root, area, controller)) return;
+  function activate(root, area, controller, game) {
+    if (!playable(root, area, controller, game)) return null;
+    if (active?.area === area) return active;
+    release();
     const extraTabIndex = !area.hasAttribute('tabindex');
     if (extraTabIndex) area.setAttribute('tabindex', '-1');
     area.focus({ preventScroll: true });
     if (document.activeElement !== area) {
       if (extraTabIndex) area.removeAttribute('tabindex');
-      return;
+      return null;
     }
     const note = document.createElement('span');
     note.className = 'tt-bp-focus-note';
     note.setAttribute('role', 'status');
     area.append(note);
     area.setAttribute(FOCUS, '');
-    active = { root, area, controller, note, extraTabIndex, guide: null, notice: '' };
+    active = { root, area, controller, game, note, extraTabIndex, guide: null, notice: '' };
+    if (game !== BATTLE && controller.inputMode.kanaMode) showGuide(active);
     tick();
+    return active;
+  }
+
+  function focusSoloOnTab() {
+    const current = document.activeElement;
+    const root = current?.closest(SOLO_ROOT) || document.querySelector(SOLO_ROOT);
+    if (!root) return null;
+    if (current && current !== document.body && current !== document.documentElement && !current.closest('[hidden], .is-hidden') &&
+        (!root.contains(current) || current.closest(INTERACTIVE))) return null;
+    const game = SOLO.find(id => root.matches(gameRoot(id)));
+    return game ? activate(root, playAreaFor(root, game), controllerFor(root, game), game) : null;
+  }
+
+  document.addEventListener('click', event => {
+    const node = event.target instanceof Element ? event.target : event.target?.parentElement;
+    if (active && (!active.area.contains(node) || node?.closest(INTERACTIVE))) release();
+    if (!node || event.button !== 0 || node.closest(INTERACTIVE)) return;
+    const root = node.closest(SURFACE)?.closest(ROOT);
+    if (!root) return;
+    const game = GAMES.find(id => root.matches(gameRoot(id)));
+    if (game) activate(root, playAreaFor(root, game), controllerFor(root, game), game);
   }, true);
 
   document.addEventListener('keydown', event => {
-    const state = active;
-    if (!state) return;
-    if (event.key === 'Escape') { release(); return; }
+    if (event.key === 'Escape') { if (active) release(); return; }
     if (event.key !== 'Tab' || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing ||
-        event.keyCode === 229 || document.activeElement !== state.area || !playable(state.root, state.area, state.controller)) return;
-    const controller = state.controller;
-    const practice = practiceSwitchable(controller);
+        event.keyCode === 229) return;
+    const state = active || (!event.repeat ? focusSoloOnTab() : null);
+    if (!state || document.activeElement !== state.area || !playable(state.root, state.area, state.controller, state.game)) return;
+    const { controller, game } = state;
+    const practice = game !== BATTLE || practiceSwitchable(controller);
     if (!practice && !allowsGuide(controller)) return;
     event.preventDefault();
     if (event.repeat) return;
     state.notice = '';
-    if (practice) {
+    if (game !== BATTLE) {
+      const toKana = !controller.inputMode.kanaMode;
+      if (!switchSolo(controller, toKana)) state.notice = 'この行では入力方式を切り替えられません';
+      else if (toKana) showGuide(state);
+      else hideGuide(state);
+    } else if (practice) {
       const requested = controller.typingPlayModeValue === 'kana' ? 'roma' : 'kana';
       if (!switchPractice(controller, requested)) state.notice = 'この行では入力方式を切り替えられません';
       else if (requested === 'kana') showGuide(state);
